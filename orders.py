@@ -53,11 +53,12 @@ def init_mongo():
     global mongo_client, db, products_col, settings_col, auth_col
     mongo_client = AsyncIOMotorClient(
         MONGO_URI,
-        serverSelectionTimeoutMS=5000,
-        connectTimeoutMS=5000,
-        socketTimeoutMS=10000,
+        serverSelectionTimeoutMS=10000,
+        connectTimeoutMS=10000,
+        socketTimeoutMS=20000,
         maxPoolSize=20,
         retryWrites=True,
+        retryReads=True,
     )
     db = mongo_client["products_bot"]
     products_col = db["products"]
@@ -73,12 +74,21 @@ async def db_call(coro, default=None):
         logger.exception("MongoDB error")
         return default
 
-async def is_authorized(uid: int) -> bool:
-    doc = await db_call(auth_col.find_one({"uid": uid}))
+async def is_authorized(uid: int):
+    try:
+        doc = await auth_col.find_one({"uid": uid})
+    except PyMongoError:
+        logger.exception("MongoDB error in is_authorized")
+        return None
     return doc is not None
 
-async def authorize(uid: int):
-    await db_call(auth_col.update_one({"uid": uid}, {"$set": {"uid": uid}}, upsert=True))
+async def authorize(uid: int) -> bool:
+    try:
+        await auth_col.update_one({"uid": uid}, {"$set": {"uid": uid}}, upsert=True)
+        return True
+    except PyMongoError:
+        logger.exception("MongoDB error in authorize")
+        return False
 
 async def get_categories() -> list:
     doc = await db_call(settings_col.find_one({"_id": "categories"}))
@@ -264,7 +274,11 @@ dp  = Dispatcher(storage=MemoryStorage())
 user_list_cache: dict = {}
 
 async def require_auth(msg: Message, state: FSMContext) -> bool:
-    if await is_authorized(msg.from_user.id):
+    authorized = await is_authorized(msg.from_user.id)
+    if authorized is None:
+        await msg.answer(DB_ERROR_TEXT)
+        return False
+    if authorized:
         return True
     current_state = await state.get_state()
     if current_state != Auth.waiting_password:
@@ -281,7 +295,11 @@ async def global_error_handler(event, exception=None):
 @dp.message(CommandStart())
 async def cmd_start(msg: Message, state: FSMContext):
     await state.clear()
-    if await is_authorized(msg.from_user.id):
+    authorized = await is_authorized(msg.from_user.id)
+    if authorized is None:
+        await msg.answer(DB_ERROR_TEXT)
+        return
+    if authorized:
         await msg.answer("👋 *Товари*\n\nОбери дію:", reply_markup=kb_main())
     else:
         await state.set_state(Auth.waiting_password)
@@ -290,7 +308,10 @@ async def cmd_start(msg: Message, state: FSMContext):
 @dp.message(Auth.waiting_password)
 async def check_password(msg: Message, state: FSMContext):
     if msg.text == BOT_PASSWORD:
-        await authorize(msg.from_user.id)
+        ok = await authorize(msg.from_user.id)
+        if not ok:
+            await msg.answer(DB_ERROR_TEXT)
+            return
         await state.clear()
         await msg.answer("✅ *Пароль вірний!*\n\nОбери дію:", reply_markup=kb_main())
     else:
