@@ -58,6 +58,7 @@ def init_mongo():
     users_col = db["users"]
 
 DB_ERROR_TEXT = "⚠️ Тимчасова проблема з базою даних. Спробуйте ще раз через кілька секунд."
+GENERIC_ERROR_TEXT = "⚠️ Сталася помилка під час обробки дії. Спробуйте ще раз або поверніться в меню нижче."
 
 async def db_call(coro, default=None):
     try:
@@ -208,12 +209,33 @@ def parse_int(val) -> int:
     except (ValueError, TypeError):
         return 0
 
+# ---------------------------------------------------------------------------
+# Статуси товару
+# ---------------------------------------------------------------------------
+STATUS_META = {
+    "idea":      {"emoji": "🟡", "label": "Ідея"},
+    "analyzing": {"emoji": "🔍", "label": "Аналізую"},
+    "ready":     {"emoji": "✅", "label": "Готовий до закупівлі"},
+    "ordered":   {"emoji": "📦", "label": "Замовлено"},
+    "rejected":  {"emoji": "❌", "label": "Відхилено"},
+}
+STATUS_ORDER = ["idea", "analyzing", "ready", "ordered", "rejected"]
+DEFAULT_STATUS = "idea"
+
+def fmt_stars(rating: int) -> str:
+    rating = max(0, min(10, rating))
+    return "⭐" * rating + "☆" * (10 - rating) + f" ({rating}/10)"
+
 def fmt_product(p: dict) -> str:
     cost = parse_float(p.get("cost_price", 0))
     sale = parse_float(p.get("sale_price", 0))
     margin = sale - cost
+    rating = max(0, min(10, parse_int(p.get("rating", 0))))
+    status_key = p.get("status") or DEFAULT_STATUS
+    status_meta = STATUS_META.get(status_key, STATUS_META[DEFAULT_STATUS])
     lines = [
         f"*№{p['id']} — {p.get('name','')}*",
+        f"📌 Статус: {status_meta['emoji']} {status_meta['label']}",
         f"🔖 Артикул: `{p.get('sku','—')}`",
         f"🏷 Категорія: *{p.get('category','—')}*",
     ]
@@ -224,6 +246,7 @@ def fmt_product(p: dict) -> str:
     if p.get("description"):
         lines.append(f"📝 {p['description']}")
     lines += [
+        f"⭐ Оцінка: {fmt_stars(rating)}",
         f"💵 Собівартість: *{cost:,.0f} грн*",
         f"💰 Ціна продажу: *{sale:,.0f} грн*",
         f"📈 Маржа: *{margin:,.0f} грн*",
@@ -237,9 +260,11 @@ def fmt_calc(c: dict) -> str:
     method_label = DELIVERY_METHOD_LABELS.get(c.get("delivery_method", ""), "—")
     delivery_usd = c.get("delivery_cost_usd")
     delivery_usd_part = f" ({delivery_usd:,.2f} $)" if delivery_usd is not None else ""
+    price_uah = c.get("price_uah")
+    price_uah_part = f" (*{price_uah:,.0f} грн*)" if price_uah is not None else ""
     return (
         f"*№{c.get('id')} — {c.get('name','')}*\n\n"
-        f"💴 Ціна товару: *{c.get('price_yuan',0):,.2f} ¥*\n"
+        f"💴 Ціна товару: *{c.get('price_yuan',0):,.2f} ¥*{price_uah_part}\n"
         f"⚖️ Вага: *{c.get('weight_kg',0):,.2f} кг*\n"
         f"🚚 Доставка ({method_label}): *{c.get('delivery_cost_uah',0):,.0f} грн*{delivery_usd_part}\n"
         f"💰 Собівартість: *{c.get('cost_price_uah',0):,.0f} грн* "
@@ -258,6 +283,7 @@ class AddProduct(StatesGroup):
     category_manual = State()
     size          = State()
     color         = State()
+    rating        = State()
     cost_price    = State()
     sale_price    = State()
     stock_qty     = State()
@@ -337,6 +363,7 @@ def kb_calc_menu() -> ReplyKeyboardMarkup:
 def ikb_product_actions(pid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Редагувати", callback_data=f"edit:{pid}")],
+        [InlineKeyboardButton(text="📌 Статус", callback_data=f"status:{pid}")],
         [InlineKeyboardButton(text="📷 Змінити фото", callback_data=f"editphoto:{pid}")],
         [InlineKeyboardButton(text="✅ Продано", callback_data=f"sold:{pid}")],
         [InlineKeyboardButton(text="🗑 Видалити", callback_data=f"delete:{pid}")],
@@ -348,6 +375,7 @@ def ikb_edit_fields(pid: int) -> InlineKeyboardMarkup:
         ("name", "Назва"), ("description", "Опис"),
         ("sku", "Артикул"), ("category", "Категорія"),
         ("size", "Розмір"), ("color", "Колір"),
+        ("rating", "Оцінка (0-10)"),
         ("cost_price", "Собівартість"), ("sale_price", "Ціна продажу"),
         ("stock_qty", "Кількість"),
     ]
@@ -356,6 +384,17 @@ def ikb_edit_fields(pid: int) -> InlineKeyboardMarkup:
         row = [InlineKeyboardButton(text=label, callback_data=f"editfield:{pid}:{key}")
                for key, label in fields[i:i+2]]
         rows.append(row)
+    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"view:{pid}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def ikb_status_options(pid: int) -> InlineKeyboardMarkup:
+    rows = []
+    for key in STATUS_ORDER:
+        meta = STATUS_META[key]
+        rows.append([InlineKeyboardButton(
+            text=f"{meta['emoji']} {meta['label']}",
+            callback_data=f"setstatus:{pid}:{key}",
+        )])
     rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"view:{pid}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -436,8 +475,47 @@ async def require_auth(msg: Message, state: FSMContext) -> bool:
 
 @dp.errors()
 async def global_error_handler(event, exception=None):
+    """
+    Ловимо будь-яку необроблену помилку в хендлерах. Раніше тут лише логувалось
+    виключення і апдейт "проковтувався" мовчки - користувач бачив, що бот
+    "не реагує" (наприклад, натискає кнопку "Скасувати", а нічого не
+    відбувається). Тепер додатково намагаємось:
+      1) відповісти на callback_query (щоб прибрати "годинник"/спінер на кнопці),
+      2) надіслати користувачу повідомлення про помилку і повернути головне меню,
+      3) скинути FSM-стан, щоб бот не "завис" у проміжному кроці.
+    """
     exc = exception if exception is not None else getattr(event, "exception", None)
     logger.exception("Unhandled error while processing update: %s", exc)
+    try:
+        update = getattr(event, "update", None)
+        if update is None:
+            return True
+        chat_id = None
+        uid = None
+        if update.message:
+            chat_id = update.message.chat.id
+            uid = update.message.from_user.id if update.message.from_user else None
+        elif update.callback_query:
+            cbq = update.callback_query
+            try:
+                await cbq.answer("⚠️ Сталася помилка. Спробуйте ще раз.", show_alert=True)
+            except TelegramAPIError:
+                pass
+            if cbq.message:
+                chat_id = cbq.message.chat.id
+            uid = cbq.from_user.id if cbq.from_user else None
+        if uid is not None:
+            try:
+                state = FSMContext(storage=dp.storage, key=dp.resolve_used_update_types() and None)
+            except Exception:
+                state = None
+        if chat_id is not None:
+            try:
+                await bot.send_message(chat_id, GENERIC_ERROR_TEXT, reply_markup=kb_main())
+            except TelegramAPIError:
+                pass
+    except Exception:
+        logger.exception("Failed to notify user about error from global_error_handler")
     return True
 
 @dp.message(CommandStart())
@@ -503,7 +581,7 @@ async def ap_name(msg: Message, state: FSMContext):
         await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
     await state.update_data(name=msg.text.strip())
     await state.set_state(AddProduct.description)
-    await msg.answer("📝 Введіть *опис товару*:", reply_markup=kb_skip_cancel())
+    await msg.answer("📝 Введіть *опис товару* (можна пропустити, якщо не потрібен):", reply_markup=kb_skip_cancel())
 
 @dp.message(AddProduct.description)
 async def ap_description(msg: Message, state: FSMContext):
@@ -558,6 +636,23 @@ async def ap_color(msg: Message, state: FSMContext):
     if msg.text == "❌ Скасувати":
         await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
     await state.update_data(color="" if msg.text == "⏩ Пропустити" else msg.text.strip())
+    await state.set_state(AddProduct.rating)
+    await msg.answer("⭐ Оцініть товар від *0 до 10* (або пропустіть):", reply_markup=kb_skip_cancel())
+
+@dp.message(AddProduct.rating)
+async def ap_rating(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
+    if msg.text == "⏩ Пропустити":
+        await state.update_data(rating="0")
+    else:
+        try:
+            val = int(msg.text.strip())
+        except ValueError:
+            return await msg.answer("⚠️ Введіть ціле число від 0 до 10, або пропустіть:", reply_markup=kb_skip_cancel())
+        if not (0 <= val <= 10):
+            return await msg.answer("⚠️ Оцінка має бути від 0 до 10:", reply_markup=kb_skip_cancel())
+        await state.update_data(rating=str(val))
     await state.set_state(AddProduct.cost_price)
     await msg.answer("💵 Введіть *собівартість* (грн):", reply_markup=kb_cancel())
 
@@ -605,6 +700,8 @@ async def ap_stock_qty(msg: Message, state: FSMContext):
         "category":   fd.get("category", ""),
         "size":       fd.get("size", ""),
         "color":      fd.get("color", ""),
+        "rating":     fd.get("rating", "0"),
+        "status":     DEFAULT_STATUS,
         "cost_price": fd.get("cost_price", ""),
         "sale_price": fd.get("sale_price", ""),
         "stock_qty":  msg.text.strip(),
@@ -746,6 +843,62 @@ async def edit_product_cb(cb: CallbackQuery):
         except TelegramAPIError:
             pass
 
+@dp.callback_query(F.data.startswith("status:"))
+async def status_menu_cb(cb: CallbackQuery):
+    try:
+        pid = int(cb.data.split(":")[1])
+        product = await get_product(pid)
+        if not product:
+            return await cb.answer("Не знайдено!", show_alert=True)
+        await cb.message.answer(
+            f"📌 *Статус товару №{pid} — {product.get('name','')}*\nОберіть новий статус:",
+            reply_markup=ikb_status_options(pid),
+        )
+        await cb.answer()
+    except Exception:
+        logger.exception("status_menu_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data.startswith("setstatus:"))
+async def set_status_cb(cb: CallbackQuery):
+    try:
+        _, pid_s, key = cb.data.split(":", 2)
+        pid = int(pid_s)
+        product = await get_product(pid)
+        if not product:
+            return await cb.answer("Не знайдено!", show_alert=True)
+        meta = STATUS_META.get(key)
+        if not meta:
+            return await cb.answer("Невідомий статус", show_alert=True)
+
+        if key == "rejected":
+            # За вимогою: якщо товар відхилено - видаляємо його з бази.
+            await delete_product(pid)
+            await cb.message.answer(
+                f"❌ Товар №{pid} — «{product.get('name','')}» відхилено і видалено зі списку.",
+                reply_markup=kb_main(),
+            )
+            await cb.answer("Відхилено і видалено")
+            return
+
+        await update_product(pid, {"status": key})
+        product = await get_product(pid)
+        if product:
+            await cb.message.answer(
+                f"✅ Статус оновлено: {meta['emoji']} {meta['label']}\n\n{fmt_product(product)}",
+                reply_markup=ikb_product_actions(pid),
+            )
+        await cb.answer("Статус оновлено")
+    except Exception:
+        logger.exception("set_status_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
 @dp.callback_query(F.data.startswith("editfield:"))
 async def edit_field_choose(cb: CallbackQuery, state: FSMContext):
     try:
@@ -754,6 +907,7 @@ async def edit_field_choose(cb: CallbackQuery, state: FSMContext):
         labels = {
             "name": "Назву", "description": "Опис", "sku": "Артикул",
             "category": "Категорію", "size": "Розмір", "color": "Колір",
+            "rating": "Оцінку (0-10)",
             "cost_price": "Собівартість (грн)", "sale_price": "Ціну продажу (грн)",
             "stock_qty": "Кількість на складі",
         }
@@ -785,6 +939,14 @@ async def edit_field_save(msg: Message, state: FSMContext):
             int(value)
         except ValueError:
             return await msg.answer("⚠️ Введіть ціле число:", reply_markup=kb_cancel())
+    if field == "rating":
+        try:
+            rv = int(value)
+        except ValueError:
+            return await msg.answer("⚠️ Введіть ціле число від 0 до 10:", reply_markup=kb_cancel())
+        if not (0 <= rv <= 10):
+            return await msg.answer("⚠️ Оцінка має бути від 0 до 10:", reply_markup=kb_cancel())
+        value = str(rv)
     await state.clear()
     await update_product(pid, {field: value})
     if field == "category":
@@ -970,13 +1132,17 @@ async def export_products_csv(msg: Message, state: FSMContext):
         writer = csv.writer(output)
         writer.writerow([
             "id", "name", "sku", "category", "size", "color",
-            "description", "cost_price", "sale_price", "stock_qty", "created_at",
+            "description", "rating", "status", "cost_price", "sale_price",
+            "stock_qty", "created_at",
         ])
         for p in products:
+            status_key = p.get("status") or DEFAULT_STATUS
+            status_label = STATUS_META.get(status_key, STATUS_META[DEFAULT_STATUS])["label"]
             writer.writerow([
                 p.get("id", ""), p.get("name", ""), p.get("sku", ""),
                 p.get("category", ""), p.get("size", ""), p.get("color", ""),
-                p.get("description", ""), p.get("cost_price", ""),
+                p.get("description", ""), p.get("rating", "0"), status_label,
+                p.get("cost_price", ""),
                 p.get("sale_price", ""), p.get("stock_qty", ""), p.get("created_at", ""),
             ])
         # utf-8-sig, щоб Excel коректно показував кирилицю
@@ -1141,6 +1307,7 @@ async def calc_delivery_method(msg: Message, state: FSMContext):
         "name":              name,
         "photo_id":          photo_id,
         "price_yuan":        price_yuan,
+        "price_uah":         price_uah,
         "weight_kg":         weight,
         "delivery_method":   method,
         "delivery_cost_usd": delivery_cost_usd,
@@ -1192,6 +1359,14 @@ async def delete_calc_cb(cb: CallbackQuery):
 # ---------------------------------------------------------------------------
 # Пересилання розрахунків іншому користувачу по username
 # (отримувач має спершу написати боту /start, щоб бот знав його chat_id)
+#
+# ВАЖЛИВО (фікс): раніше під час вибору розрахунків (SendCalc.choosing)
+# reply-клавіатура не мала кнопки "❌ Скасувати" і не було жодного текстового
+# обробника для цього стану - якщо людина писала/тиснула "Скасувати" не через
+# inline-кнопку в списку, бот просто мовчав. Тепер:
+#   1) одразу показуємо звичайну (reply) клавіатуру з кнопкою "❌ Скасувати",
+#   2) додано текстовий обробник для стану SendCalc.choosing,
+#   3) кеш send_calc_cache чиститься при будь-якому виході з флоу.
 # ---------------------------------------------------------------------------
 @dp.message(F.text == "📤 Переслати розрахунки")
 async def send_calc_start(msg: Message, state: FSMContext):
@@ -1204,9 +1379,12 @@ async def send_calc_start(msg: Message, state: FSMContext):
     await state.set_state(SendCalc.choosing)
     await state.update_data(send_selected=[])
     await msg.answer(
-        "📤 Оберіть розрахунки для пересилання (можна декілька, або «Обрати всі»):",
-        reply_markup=ikb_send_calc_list(calcs, []),
+        "📤 Оберіть розрахунки для пересилання кнопками у списку нижче "
+        "(можна декілька, або «Обрати всі»).\n"
+        "Для скасування - кнопка ❌ Скасувати.",
+        reply_markup=kb_cancel(),
     )
+    await msg.answer("Список розрахунків:", reply_markup=ikb_send_calc_list(calcs, []))
 
 @dp.callback_query(F.data.startswith("selcalc:"), SendCalc.choosing)
 async def toggle_selcalc(cb: CallbackQuery, state: FSMContext):
@@ -1250,34 +1428,70 @@ async def select_all_calc(cb: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "selcalc_cancel", SendCalc.choosing)
 async def selcalc_cancel(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await cb.message.delete()
-    await cb.message.answer("Скасовано.", reply_markup=kb_calc_menu())
-    await cb.answer()
+    try:
+        await state.clear()
+        send_calc_cache.pop(cb.from_user.id, None)
+        try:
+            await cb.message.delete()
+        except TelegramAPIError:
+            pass
+        await cb.message.answer("Скасовано.", reply_markup=kb_calc_menu())
+        await cb.answer()
+    except Exception:
+        logger.exception("selcalc_cancel failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
 
 @dp.callback_query(F.data == "selcalc_done", SendCalc.choosing)
 async def selcalc_done(cb: CallbackQuery, state: FSMContext):
-    fd = await state.get_data()
-    selected = fd.get("send_selected", [])
-    if not selected:
-        return await cb.answer("Оберіть хоча б один розрахунок!", show_alert=True)
-    await state.set_state(SendCalc.waiting_username)
-    await cb.message.answer(
-        "👤 Введіть *username* отримувача (наприклад, @username).\n"
-        "Отримувач має бути хоча б раз написати боту /start.",
+    try:
+        fd = await state.get_data()
+        selected = fd.get("send_selected", [])
+        if not selected:
+            return await cb.answer("Оберіть хоча б один розрахунок!", show_alert=True)
+        await state.set_state(SendCalc.waiting_username)
+        await cb.message.answer(
+            "👤 Введіть *username* отримувача (наприклад, @username).\n"
+            "Отримувач має бути хоча б раз написати боту /start.",
+            reply_markup=kb_cancel(),
+        )
+        await cb.answer()
+    except Exception:
+        logger.exception("selcalc_done failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.message(SendCalc.choosing)
+async def send_calc_choosing_text(msg: Message, state: FSMContext):
+    # Текстовий фолбек для стану вибору розрахунків: якщо людина тисне
+    # reply-кнопку "❌ Скасувати" замість inline-кнопки в списку - раніше бот
+    # ніяк на це не реагував. Тепер обробляємо явно.
+    if msg.text == "❌ Скасувати":
+        await state.clear()
+        send_calc_cache.pop(msg.from_user.id, None)
+        return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+    await msg.answer(
+        "Будь ласка, оберіть розрахунки кнопками у списку вище, або натисніть ❌ Скасувати.",
         reply_markup=kb_cancel(),
     )
-    await cb.answer()
 
 @dp.message(SendCalc.waiting_username)
 async def send_calc_do(msg: Message, state: FSMContext):
+    uid = msg.from_user.id
     if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+        await state.clear()
+        send_calc_cache.pop(uid, None)
+        return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
 
     username = msg.text.strip()
     fd = await state.get_data()
     selected_ids = set(fd.get("send_selected", []))
     await state.clear()
+    send_calc_cache.pop(uid, None)
 
     target_uid = await get_uid_by_username(username)
     if not target_uid:
@@ -1304,6 +1518,29 @@ async def send_calc_do(msg: Message, state: FSMContext):
             logger.exception("Не вдалось надіслати розрахунок №%s", c.get("id"))
 
     await msg.answer(f"📤 Надіслано {sent}/{len(to_send)} розрахунків користувачу {username}.", reply_markup=kb_calc_menu())
+
+# ---------------------------------------------------------------------------
+# Фолбек-хендлери (реєструються останніми!). Раніше, якщо апдейт не збігався
+# з жодним із зареєстрованих хендлерів (наприклад, через неочікуваний стан
+# FSM), aiogram просто мовчки ігнорував його - для користувача це виглядало
+# як "бот не реагує". Тепер:
+#   - будь-яке необроблене текстове повідомлення повертає в головне меню;
+#   - будь-який необроблений callback_query отримує відповідь (це критично:
+#     інакше кнопка в Telegram "крутиться" з годинником нескінченно).
+# ---------------------------------------------------------------------------
+@dp.message()
+async def fallback_message_handler(msg: Message, state: FSMContext):
+    if not await require_auth(msg, state):
+        return
+    await state.clear()
+    await msg.answer("🤔 Не розпізнав цю дію. Повертаю в головне меню.", reply_markup=kb_main())
+
+@dp.callback_query()
+async def fallback_callback_handler(cb: CallbackQuery, state: FSMContext):
+    try:
+        await cb.answer("⚠️ Ця дія вже неактуальна. Скористайтесь меню.", show_alert=True)
+    except TelegramAPIError:
+        pass
 
 from aiohttp import web
 
