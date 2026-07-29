@@ -1,4 +1,6 @@
 import asyncio
+import csv
+import io
 import logging
 import os
 from datetime import datetime
@@ -12,7 +14,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    Message, CallbackQuery,
+    Message, CallbackQuery, BufferedInputFile,
     InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
 )
@@ -35,9 +37,10 @@ products_col = None
 settings_col = None
 auth_col = None
 calc_col = None
+users_col = None
 
 def init_mongo():
-    global mongo_client, db, products_col, settings_col, auth_col, calc_col
+    global mongo_client, db, products_col, settings_col, auth_col, calc_col, users_col
     mongo_client = AsyncIOMotorClient(
         MONGO_URI,
         serverSelectionTimeoutMS=10000,
@@ -52,6 +55,7 @@ def init_mongo():
     settings_col = db["settings"]
     auth_col = db["auth"]
     calc_col = db["calc_results"]
+    users_col = db["users"]
 
 DB_ERROR_TEXT = "⚠️ Тимчасова проблема з базою даних. Спробуйте ще раз через кілька секунд."
 
@@ -102,6 +106,32 @@ async def authorize(uid: int) -> bool:
         logger.exception("MongoDB error in authorize")
         return False
 
+# ---------------------------------------------------------------------------
+# Users. Зберігаємо мапінг username -> uid для всіх, хто хоч раз натиснув
+# /start, щоб мати змогу надсилати їм повідомлення від імені бота за
+# username (Telegram Bot API не дозволяє відправляти повідомлення в приватний
+# чат просто за username - потрібен chat_id, який ми і зберігаємо тут).
+# ---------------------------------------------------------------------------
+async def upsert_user(uid: int, username: str | None, first_name: str = ""):
+    username_norm = (username or "").lower().lstrip("@")
+    await db_call(users_col.update_one(
+        {"uid": uid},
+        {"$set": {
+            "uid": uid,
+            "username": username_norm,
+            "first_name": first_name,
+            "last_seen": datetime.now().isoformat(),
+        }},
+        upsert=True,
+    ))
+
+async def get_uid_by_username(username: str):
+    username_norm = username.strip().lower().lstrip("@")
+    if not username_norm:
+        return None
+    doc = await db_call(users_col.find_one({"username": username_norm}))
+    return doc["uid"] if doc else None
+
 async def get_categories() -> list:
     doc = await db_call(settings_col.find_one({"_id": "categories"}))
     return doc["values"] if doc else []
@@ -130,11 +160,16 @@ async def get_all_products() -> list:
     return await db_call(cursor.to_list(length=None), default=[]) or []
 
 # ---------------------------------------------------------------------------
-# Калькулятор: налаштування (ціна доставки за 1 кг, курс юаня, курс долара)
+# Калькулятор: налаштування (ціна доставки за 1 кг авіа/морем, курс юаня, курс долара)
 # ---------------------------------------------------------------------------
 async def get_calc_settings() -> dict:
     doc = await db_call(settings_col.find_one({"_id": "calc_settings"}))
-    defaults = {"price_per_kg": 0.0, "yuan_rate": 0.0, "usd_rate": 0.0}
+    defaults = {
+        "price_per_kg_avia": 0.0,
+        "price_per_kg_sea": 0.0,
+        "yuan_rate": 0.0,
+        "usd_rate": 0.0,
+    }
     if doc:
         for k in defaults:
             if k in doc:
@@ -154,6 +189,9 @@ async def add_calc(record: dict):
 async def get_all_calcs() -> list:
     cursor = calc_col.find({}, {"_id": 0}).sort("id", -1)
     return await db_call(cursor.to_list(length=None), default=[]) or []
+
+async def get_calc(cid: int) -> dict | None:
+    return await db_call(calc_col.find_one({"id": cid}, {"_id": 0}))
 
 async def delete_calc(cid: int):
     await db_call(calc_col.delete_one({"id": cid}))
@@ -193,12 +231,15 @@ def fmt_product(p: dict) -> str:
     ]
     return "\n".join(lines)
 
+DELIVERY_METHOD_LABELS = {"avia": "✈️ Авіа", "sea": "🚢 Море"}
+
 def fmt_calc(c: dict) -> str:
+    method_label = DELIVERY_METHOD_LABELS.get(c.get("delivery_method", ""), "—")
     return (
         f"*№{c.get('id')} — {c.get('name','')}*\n\n"
         f"💴 Ціна товару: *{c.get('price_yuan',0):,.2f} ¥*\n"
         f"⚖️ Вага: *{c.get('weight_kg',0):,.2f} кг*\n"
-        f"🚚 Доставка: *{c.get('delivery_cost_uah',0):,.0f} грн*\n"
+        f"🚚 Доставка ({method_label}): *{c.get('delivery_cost_uah',0):,.0f} грн*\n"
         f"💰 Собівартість: *{c.get('cost_price_uah',0):,.0f} грн* "
         f"(*{c.get('cost_price_usd',0):,.2f} $*)"
     )
@@ -241,16 +282,22 @@ class CalcSettingsEdit(StatesGroup):
     typing = State()
 
 class CalcProduct(StatesGroup):
-    name       = State()
-    price_yuan = State()
-    weight     = State()
+    photo           = State()
+    name            = State()
+    price_yuan      = State()
+    weight          = State()
+    delivery_method = State()
+
+class SendCalc(StatesGroup):
+    choosing = State()
+    waiting_username = State()
 
 def kb_main() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="➕ Новий товар"), KeyboardButton(text="📋 Всі товари")],
         [KeyboardButton(text="🔍 За назвою"), KeyboardButton(text="🔠 За артикулом")],
         [KeyboardButton(text="🏷 За категорією"), KeyboardButton(text="⚙️ Категорії")],
-        [KeyboardButton(text="🧮 Калькулятор")],
+        [KeyboardButton(text="🧮 Калькулятор"), KeyboardButton(text="📤 CSV товарів")],
     ], resize_keyboard=True)
 
 def kb_cancel() -> ReplyKeyboardMarkup:
@@ -259,6 +306,12 @@ def kb_cancel() -> ReplyKeyboardMarkup:
 def kb_skip_cancel() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="⏩ Пропустити"), KeyboardButton(text="❌ Скасувати")]
+    ], resize_keyboard=True)
+
+def kb_delivery_method() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="✈️ Авіа"), KeyboardButton(text="🚢 Море")],
+        [KeyboardButton(text="❌ Скасувати")],
     ], resize_keyboard=True)
 
 def kb_from_list(items: list, with_manual=False) -> ReplyKeyboardMarkup:
@@ -274,6 +327,7 @@ def kb_calc_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="➕ Порахувати товар")],
         [KeyboardButton(text="📄 Мої розрахунки")],
+        [KeyboardButton(text="📤 Переслати розрахунки")],
         [KeyboardButton(text="⚙️ Налаштування калькулятора")],
         [KeyboardButton(text="◀️ Головне меню")],
     ], resize_keyboard=True)
@@ -329,7 +383,8 @@ def ikb_categories_settings() -> InlineKeyboardMarkup:
 
 def ikb_calc_settings() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💴 Змінити ціну доставки за 1 кг", callback_data="calcset:price_per_kg")],
+        [InlineKeyboardButton(text="✈️ Ціна доставки авіа (за 1 кг)", callback_data="calcset:price_per_kg_avia")],
+        [InlineKeyboardButton(text="🚢 Ціна доставки морем (за 1 кг)", callback_data="calcset:price_per_kg_sea")],
         [InlineKeyboardButton(text="💱 Змінити курс юаня", callback_data="calcset:yuan_rate")],
         [InlineKeyboardButton(text="💵 Змінити курс долара", callback_data="calcset:usd_rate")],
     ])
@@ -339,8 +394,21 @@ def ikb_calc_actions(cid: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🗑 Видалити", callback_data=f"delcalc:{cid}")],
     ])
 
+def ikb_send_calc_list(calcs: list, selected_ids) -> InlineKeyboardMarkup:
+    selected = set(selected_ids)
+    rows = []
+    for c in calcs:
+        mark = "✅ " if c["id"] in selected else ""
+        label = f"{mark}№{c['id']} {c.get('name','')[:22]}"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"selcalc:{c['id']}")])
+    rows.append([InlineKeyboardButton(text="📌 Обрати всі", callback_data="selcalc_all")])
+    rows.append([InlineKeyboardButton(text="✅ Готово", callback_data="selcalc_done")])
+    rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="selcalc_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 CALC_SETTING_LABELS = {
-    "price_per_kg": "ціну доставки за 1 кг (грн)",
+    "price_per_kg_avia": "ціну доставки авіа за 1 кг (грн)",
+    "price_per_kg_sea": "ціну доставки морем за 1 кг (грн)",
     "yuan_rate": "курс юаня (грн за 1¥)",
     "usd_rate": "курс долара (грн за 1$)",
 }
@@ -349,6 +417,7 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MAR
 dp  = Dispatcher(storage=MemoryStorage())
 
 user_list_cache: dict = {}
+send_calc_cache: dict = {}
 
 async def require_auth(msg: Message, state: FSMContext) -> bool:
     authorized = await is_authorized(msg.from_user.id)
@@ -372,6 +441,7 @@ async def global_error_handler(event, exception=None):
 @dp.message(CommandStart())
 async def cmd_start(msg: Message, state: FSMContext):
     await state.clear()
+    await upsert_user(msg.from_user.id, msg.from_user.username, msg.from_user.first_name or "")
     authorized = await is_authorized(msg.from_user.id)
     if authorized is None:
         await msg.answer(DB_ERROR_TEXT)
@@ -884,6 +954,40 @@ async def cfg_del_cat_do(msg: Message, state: FSMContext):
         await msg.answer("Не знайдено.", reply_markup=kb_main())
 
 # ---------------------------------------------------------------------------
+# CSV експорт товарів
+# ---------------------------------------------------------------------------
+@dp.message(F.text == "📤 CSV товарів")
+async def export_products_csv(msg: Message, state: FSMContext):
+    if not await require_auth(msg, state): return
+    try:
+        products = await get_all_products()
+        if not products:
+            return await msg.answer("📭 Товарів ще немає.", reply_markup=kb_main())
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "id", "name", "sku", "category", "size", "color",
+            "description", "cost_price", "sale_price", "stock_qty", "created_at",
+        ])
+        for p in products:
+            writer.writerow([
+                p.get("id", ""), p.get("name", ""), p.get("sku", ""),
+                p.get("category", ""), p.get("size", ""), p.get("color", ""),
+                p.get("description", ""), p.get("cost_price", ""),
+                p.get("sale_price", ""), p.get("stock_qty", ""), p.get("created_at", ""),
+            ])
+        # utf-8-sig, щоб Excel коректно показував кирилицю
+        csv_bytes = output.getvalue().encode("utf-8-sig")
+        filename = f"products_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+        file = BufferedInputFile(csv_bytes, filename=filename)
+        await msg.answer_document(document=file, caption=f"📤 Експорт товарів — {len(products)} шт.")
+        await msg.answer("Готово ✅", reply_markup=kb_main())
+    except Exception:
+        logger.exception("export_products_csv failed")
+        await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
+
+# ---------------------------------------------------------------------------
 # Калькулятор
 # ---------------------------------------------------------------------------
 @dp.message(F.text == "🧮 Калькулятор")
@@ -898,7 +1002,8 @@ async def calc_settings_menu(msg: Message, state: FSMContext):
     s = await get_calc_settings()
     text = (
         "⚙️ *Налаштування калькулятора*\n\n"
-        f"💴 Ціна доставки за 1 кг: *{s['price_per_kg']:.2f} грн*\n"
+        f"✈️ Доставка авіа за 1 кг: *{s['price_per_kg_avia']:.2f} грн*\n"
+        f"🚢 Доставка морем за 1 кг: *{s['price_per_kg_sea']:.2f} грн*\n"
         f"💱 Курс юаня: *{s['yuan_rate']:.2f} грн*\n"
         f"💵 Курс долара: *{s['usd_rate']:.2f} грн*\n\n"
         "Обери, що змінити:"
@@ -937,7 +1042,8 @@ async def calcset_save(msg: Message, state: FSMContext):
     s = await get_calc_settings()
     text = (
         "✅ Збережено!\n\n"
-        f"💴 Ціна доставки за 1 кг: *{s['price_per_kg']:.2f} грн*\n"
+        f"✈️ Доставка авіа за 1 кг: *{s['price_per_kg_avia']:.2f} грн*\n"
+        f"🚢 Доставка морем за 1 кг: *{s['price_per_kg_sea']:.2f} грн*\n"
         f"💱 Курс юаня: *{s['yuan_rate']:.2f} грн*\n"
         f"💵 Курс долара: *{s['usd_rate']:.2f} грн*"
     )
@@ -949,12 +1055,29 @@ async def calc_start(msg: Message, state: FSMContext):
     s = await get_calc_settings()
     if not all(s.values()):
         return await msg.answer(
-            "⚠️ Спочатку задайте ціну доставки, курс юаня і курс долара "
+            "⚠️ Спочатку задайте ціни доставки (авіа і морем), курс юаня і курс долара "
             "в *⚙️ Налаштування калькулятора*.",
             reply_markup=kb_calc_menu(),
         )
+    await state.set_state(CalcProduct.photo)
+    await msg.answer("📷 Надішліть *фото товару* (або пропустіть):", reply_markup=kb_skip_cancel())
+
+@dp.message(CalcProduct.photo, F.photo)
+async def calc_photo(msg: Message, state: FSMContext):
+    file_id = msg.photo[-1].file_id
+    await state.update_data(calc_photo_id=file_id)
     await state.set_state(CalcProduct.name)
     await msg.answer("📝 Введіть *назву товару*:", reply_markup=kb_cancel())
+
+@dp.message(CalcProduct.photo)
+async def calc_photo_text(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+    if msg.text == "⏩ Пропустити":
+        await state.update_data(calc_photo_id="")
+        await state.set_state(CalcProduct.name)
+        return await msg.answer("📝 Введіть *назву товару*:", reply_markup=kb_cancel())
+    await msg.answer("📷 Надішліть фото або натисніть «⏩ Пропустити»:", reply_markup=kb_skip_cancel())
 
 @dp.message(CalcProduct.name)
 async def calc_name(msg: Message, state: FSMContext):
@@ -982,14 +1105,28 @@ async def calc_weight(msg: Message, state: FSMContext):
     weight = parse_float(msg.text)
     if weight <= 0:
         return await msg.answer("⚠️ Введіть додатнє число, наприклад *0.5*:", reply_markup=kb_cancel())
+    await state.update_data(calc_weight=weight)
+    await state.set_state(CalcProduct.delivery_method)
+    await msg.answer("🚚 Оберіть *спосіб доставки*:", reply_markup=kb_delivery_method())
 
+@dp.message(CalcProduct.delivery_method)
+async def calc_delivery_method(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+    if msg.text not in ("✈️ Авіа", "🚢 Море"):
+        return await msg.answer("Будь ласка, оберіть спосіб доставки кнопкою нижче:", reply_markup=kb_delivery_method())
+
+    method = "avia" if msg.text == "✈️ Авіа" else "sea"
     fd = await state.get_data()
     name = fd["calc_name"]
     price_yuan = fd["calc_price_yuan"]
+    weight = fd["calc_weight"]
+    photo_id = fd.get("calc_photo_id", "")
     await state.clear()
 
     s = await get_calc_settings()
-    delivery_cost_uah = weight * s["price_per_kg"]
+    rate_per_kg = s["price_per_kg_avia"] if method == "avia" else s["price_per_kg_sea"]
+    delivery_cost_uah = weight * rate_per_kg
     price_uah = price_yuan * s["yuan_rate"]
     cost_price_uah = price_uah + delivery_cost_uah
     cost_price_usd = cost_price_uah / s["usd_rate"] if s["usd_rate"] else 0.0
@@ -997,8 +1134,10 @@ async def calc_weight(msg: Message, state: FSMContext):
     record = {
         "id":                await next_calc_id(),
         "name":              name,
+        "photo_id":          photo_id,
         "price_yuan":        price_yuan,
         "weight_kg":         weight,
+        "delivery_method":   method,
         "delivery_cost_uah": delivery_cost_uah,
         "cost_price_uah":    cost_price_uah,
         "cost_price_usd":    cost_price_usd,
@@ -1007,7 +1146,10 @@ async def calc_weight(msg: Message, state: FSMContext):
     }
     await add_calc(record)
 
-    await msg.answer(fmt_calc(record), reply_markup=ikb_calc_actions(record["id"]))
+    if photo_id:
+        await msg.answer_photo(photo=photo_id, caption=fmt_calc(record), reply_markup=ikb_calc_actions(record["id"]))
+    else:
+        await msg.answer(fmt_calc(record), reply_markup=ikb_calc_actions(record["id"]))
     await msg.answer("Готово ✅ Розрахунок збережено.", reply_markup=kb_calc_menu())
 
 @dp.message(F.text == "📄 Мої розрахунки")
@@ -1018,14 +1160,21 @@ async def list_calcs(msg: Message, state: FSMContext):
         return await msg.answer("📭 Розрахунків ще немає.", reply_markup=kb_calc_menu())
     await msg.answer(f"📄 *Розрахунки* — {len(calcs)} шт.", reply_markup=kb_calc_menu())
     for c in calcs:
-        await msg.answer(fmt_calc(c), reply_markup=ikb_calc_actions(c["id"]))
+        if c.get("photo_id"):
+            await msg.answer_photo(photo=c["photo_id"], caption=fmt_calc(c), reply_markup=ikb_calc_actions(c["id"]))
+        else:
+            await msg.answer(fmt_calc(c), reply_markup=ikb_calc_actions(c["id"]))
 
 @dp.callback_query(F.data.startswith("delcalc:"))
 async def delete_calc_cb(cb: CallbackQuery):
     try:
         cid = int(cb.data.split(":")[1])
         await delete_calc(cid)
-        await cb.message.edit_text(f"🗑 Розрахунок №{cid} видалено.")
+        text = f"🗑 Розрахунок №{cid} видалено."
+        if cb.message.photo:
+            await cb.message.edit_caption(caption=text)
+        else:
+            await cb.message.edit_text(text)
         await cb.answer("Видалено!")
     except Exception:
         logger.exception("delete_calc_cb failed")
@@ -1033,6 +1182,122 @@ async def delete_calc_cb(cb: CallbackQuery):
             await cb.answer(DB_ERROR_TEXT, show_alert=True)
         except TelegramAPIError:
             pass
+
+# ---------------------------------------------------------------------------
+# Пересилання розрахунків іншому користувачу по username
+# (отримувач має спершу написати боту /start, щоб бот знав його chat_id)
+# ---------------------------------------------------------------------------
+@dp.message(F.text == "📤 Переслати розрахунки")
+async def send_calc_start(msg: Message, state: FSMContext):
+    if not await require_auth(msg, state): return
+    calcs = await get_all_calcs()
+    if not calcs:
+        return await msg.answer("📭 Розрахунків ще немає.", reply_markup=kb_calc_menu())
+    uid = msg.from_user.id
+    send_calc_cache[uid] = calcs
+    await state.set_state(SendCalc.choosing)
+    await state.update_data(send_selected=[])
+    await msg.answer(
+        "📤 Оберіть розрахунки для пересилання (можна декілька, або «Обрати всі»):",
+        reply_markup=ikb_send_calc_list(calcs, []),
+    )
+
+@dp.callback_query(F.data.startswith("selcalc:"), SendCalc.choosing)
+async def toggle_selcalc(cb: CallbackQuery, state: FSMContext):
+    try:
+        cid = int(cb.data.split(":")[1])
+        fd = await state.get_data()
+        selected = set(fd.get("send_selected", []))
+        if cid in selected:
+            selected.discard(cid)
+        else:
+            selected.add(cid)
+        await state.update_data(send_selected=list(selected))
+        uid = cb.from_user.id
+        calcs = send_calc_cache.get(uid) or await get_all_calcs()
+        send_calc_cache[uid] = calcs
+        await cb.message.edit_reply_markup(reply_markup=ikb_send_calc_list(calcs, selected))
+        await cb.answer()
+    except Exception:
+        logger.exception("toggle_selcalc failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data == "selcalc_all", SendCalc.choosing)
+async def select_all_calc(cb: CallbackQuery, state: FSMContext):
+    try:
+        uid = cb.from_user.id
+        calcs = send_calc_cache.get(uid) or await get_all_calcs()
+        send_calc_cache[uid] = calcs
+        all_ids = [c["id"] for c in calcs]
+        await state.update_data(send_selected=all_ids)
+        await cb.message.edit_reply_markup(reply_markup=ikb_send_calc_list(calcs, set(all_ids)))
+        await cb.answer("Обрано всі")
+    except Exception:
+        logger.exception("select_all_calc failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data == "selcalc_cancel", SendCalc.choosing)
+async def selcalc_cancel(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.delete()
+    await cb.message.answer("Скасовано.", reply_markup=kb_calc_menu())
+    await cb.answer()
+
+@dp.callback_query(F.data == "selcalc_done", SendCalc.choosing)
+async def selcalc_done(cb: CallbackQuery, state: FSMContext):
+    fd = await state.get_data()
+    selected = fd.get("send_selected", [])
+    if not selected:
+        return await cb.answer("Оберіть хоча б один розрахунок!", show_alert=True)
+    await state.set_state(SendCalc.waiting_username)
+    await cb.message.answer(
+        "👤 Введіть *username* отримувача (наприклад, @username).\n"
+        "Отримувач має бути хоча б раз написати боту /start.",
+        reply_markup=kb_cancel(),
+    )
+    await cb.answer()
+
+@dp.message(SendCalc.waiting_username)
+async def send_calc_do(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+
+    username = msg.text.strip()
+    fd = await state.get_data()
+    selected_ids = set(fd.get("send_selected", []))
+    await state.clear()
+
+    target_uid = await get_uid_by_username(username)
+    if not target_uid:
+        return await msg.answer(
+            f"⚠️ Користувача {username} не знайдено.\n"
+            "Отримувач має спершу написати боту /start (тоді бот зможе йому щось надіслати).",
+            reply_markup=kb_calc_menu(),
+        )
+
+    all_calcs = await get_all_calcs()
+    to_send = [c for c in all_calcs if c["id"] in selected_ids]
+    if not to_send:
+        return await msg.answer("⚠️ Обрані розрахунки не знайдено (можливо, вже видалені).", reply_markup=kb_calc_menu())
+
+    sent = 0
+    for c in to_send:
+        try:
+            if c.get("photo_id"):
+                await bot.send_photo(chat_id=target_uid, photo=c["photo_id"], caption=fmt_calc(c))
+            else:
+                await bot.send_message(chat_id=target_uid, text=fmt_calc(c))
+            sent += 1
+        except TelegramAPIError:
+            logger.exception("Не вдалось надіслати розрахунок №%s", c.get("id"))
+
+    await msg.answer(f"📤 Надіслано {sent}/{len(to_send)} розрахунків користувачу {username}.", reply_markup=kb_calc_menu())
 
 from aiohttp import web
 
