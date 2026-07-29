@@ -160,7 +160,7 @@ async def get_all_products() -> list:
     return await db_call(cursor.to_list(length=None), default=[]) or []
 
 # ---------------------------------------------------------------------------
-# Калькулятор: налаштування (ціна доставки за 1 кг авіа/морем, курс юаня, курс долара)
+# Калькулятор: налаштування (ціна доставки за 1 кг авіа/морем у $, курс юаня, курс долара)
 # ---------------------------------------------------------------------------
 async def get_calc_settings() -> dict:
     doc = await db_call(settings_col.find_one({"_id": "calc_settings"}))
@@ -235,11 +235,13 @@ DELIVERY_METHOD_LABELS = {"avia": "✈️ Авіа", "sea": "🚢 Море"}
 
 def fmt_calc(c: dict) -> str:
     method_label = DELIVERY_METHOD_LABELS.get(c.get("delivery_method", ""), "—")
+    delivery_usd = c.get("delivery_cost_usd")
+    delivery_usd_part = f" ({delivery_usd:,.2f} $)" if delivery_usd is not None else ""
     return (
         f"*№{c.get('id')} — {c.get('name','')}*\n\n"
         f"💴 Ціна товару: *{c.get('price_yuan',0):,.2f} ¥*\n"
         f"⚖️ Вага: *{c.get('weight_kg',0):,.2f} кг*\n"
-        f"🚚 Доставка ({method_label}): *{c.get('delivery_cost_uah',0):,.0f} грн*\n"
+        f"🚚 Доставка ({method_label}): *{c.get('delivery_cost_uah',0):,.0f} грн*{delivery_usd_part}\n"
         f"💰 Собівартість: *{c.get('cost_price_uah',0):,.0f} грн* "
         f"(*{c.get('cost_price_usd',0):,.2f} $*)"
     )
@@ -383,8 +385,8 @@ def ikb_categories_settings() -> InlineKeyboardMarkup:
 
 def ikb_calc_settings() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✈️ Ціна доставки авіа (за 1 кг)", callback_data="calcset:price_per_kg_avia")],
-        [InlineKeyboardButton(text="🚢 Ціна доставки морем (за 1 кг)", callback_data="calcset:price_per_kg_sea")],
+        [InlineKeyboardButton(text="✈️ Ціна доставки авіа (за 1 кг, $)", callback_data="calcset:price_per_kg_avia")],
+        [InlineKeyboardButton(text="🚢 Ціна доставки морем (за 1 кг, $)", callback_data="calcset:price_per_kg_sea")],
         [InlineKeyboardButton(text="💱 Змінити курс юаня", callback_data="calcset:yuan_rate")],
         [InlineKeyboardButton(text="💵 Змінити курс долара", callback_data="calcset:usd_rate")],
     ])
@@ -407,8 +409,8 @@ def ikb_send_calc_list(calcs: list, selected_ids) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 CALC_SETTING_LABELS = {
-    "price_per_kg_avia": "ціну доставки авіа за 1 кг (грн)",
-    "price_per_kg_sea": "ціну доставки морем за 1 кг (грн)",
+    "price_per_kg_avia": "ціну доставки авіа за 1 кг ($)",
+    "price_per_kg_sea": "ціну доставки морем за 1 кг ($)",
     "yuan_rate": "курс юаня (грн за 1¥)",
     "usd_rate": "курс долара (грн за 1$)",
 }
@@ -1002,8 +1004,8 @@ async def calc_settings_menu(msg: Message, state: FSMContext):
     s = await get_calc_settings()
     text = (
         "⚙️ *Налаштування калькулятора*\n\n"
-        f"✈️ Доставка авіа за 1 кг: *{s['price_per_kg_avia']:.2f} грн*\n"
-        f"🚢 Доставка морем за 1 кг: *{s['price_per_kg_sea']:.2f} грн*\n"
+        f"✈️ Доставка авіа за 1 кг: *{s['price_per_kg_avia']:.2f} $*\n"
+        f"🚢 Доставка морем за 1 кг: *{s['price_per_kg_sea']:.2f} $*\n"
         f"💱 Курс юаня: *{s['yuan_rate']:.2f} грн*\n"
         f"💵 Курс долара: *{s['usd_rate']:.2f} грн*\n\n"
         "Обери, що змінити:"
@@ -1042,8 +1044,8 @@ async def calcset_save(msg: Message, state: FSMContext):
     s = await get_calc_settings()
     text = (
         "✅ Збережено!\n\n"
-        f"✈️ Доставка авіа за 1 кг: *{s['price_per_kg_avia']:.2f} грн*\n"
-        f"🚢 Доставка морем за 1 кг: *{s['price_per_kg_sea']:.2f} грн*\n"
+        f"✈️ Доставка авіа за 1 кг: *{s['price_per_kg_avia']:.2f} $*\n"
+        f"🚢 Доставка морем за 1 кг: *{s['price_per_kg_sea']:.2f} $*\n"
         f"💱 Курс юаня: *{s['yuan_rate']:.2f} грн*\n"
         f"💵 Курс долара: *{s['usd_rate']:.2f} грн*"
     )
@@ -1055,7 +1057,7 @@ async def calc_start(msg: Message, state: FSMContext):
     s = await get_calc_settings()
     if not all(s.values()):
         return await msg.answer(
-            "⚠️ Спочатку задайте ціни доставки (авіа і морем), курс юаня і курс долара "
+            "⚠️ Спочатку задайте ціни доставки (авіа і морем, у $), курс юаня і курс долара "
             "в *⚙️ Налаштування калькулятора*.",
             reply_markup=kb_calc_menu(),
         )
@@ -1125,8 +1127,11 @@ async def calc_delivery_method(msg: Message, state: FSMContext):
     await state.clear()
 
     s = await get_calc_settings()
-    rate_per_kg = s["price_per_kg_avia"] if method == "avia" else s["price_per_kg_sea"]
-    delivery_cost_uah = weight * rate_per_kg
+    # Ціна доставки за 1 кг зберігається в доларах.
+    rate_per_kg_usd = s["price_per_kg_avia"] if method == "avia" else s["price_per_kg_sea"]
+    delivery_cost_usd = weight * rate_per_kg_usd
+    delivery_cost_uah = delivery_cost_usd * s["usd_rate"]
+
     price_uah = price_yuan * s["yuan_rate"]
     cost_price_uah = price_uah + delivery_cost_uah
     cost_price_usd = cost_price_uah / s["usd_rate"] if s["usd_rate"] else 0.0
@@ -1138,6 +1143,7 @@ async def calc_delivery_method(msg: Message, state: FSMContext):
         "price_yuan":        price_yuan,
         "weight_kg":         weight,
         "delivery_method":   method,
+        "delivery_cost_usd": delivery_cost_usd,
         "delivery_cost_uah": delivery_cost_uah,
         "cost_price_uah":    cost_price_uah,
         "cost_price_usd":    cost_price_usd,
