@@ -1,11 +1,8 @@
 import asyncio
-import io
 import logging
 import os
 from datetime import datetime
 
-import cloudinary
-import cloudinary.uploader
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -32,25 +29,15 @@ BOT_TOKEN    = os.environ["BOT_TOKEN"]
 BOT_PASSWORD = os.environ["BOT_PASSWORD"]
 MONGO_URI    = os.environ["MONGO_URI"]
 
-CLOUDINARY_CLOUD_NAME = os.environ["CLOUDINARY_CLOUD_NAME"]
-CLOUDINARY_API_KEY    = os.environ["CLOUDINARY_API_KEY"]
-CLOUDINARY_API_SECRET = os.environ["CLOUDINARY_API_SECRET"]
-
-cloudinary.config(
-    cloud_name=CLOUDINARY_CLOUD_NAME,
-    api_key=CLOUDINARY_API_KEY,
-    api_secret=CLOUDINARY_API_SECRET,
-    secure=True,
-)
-
 mongo_client: AsyncIOMotorClient | None = None
 db = None
 products_col = None
 settings_col = None
 auth_col = None
+calc_col = None
 
 def init_mongo():
-    global mongo_client, db, products_col, settings_col, auth_col
+    global mongo_client, db, products_col, settings_col, auth_col, calc_col
     mongo_client = AsyncIOMotorClient(
         MONGO_URI,
         serverSelectionTimeoutMS=10000,
@@ -64,6 +51,7 @@ def init_mongo():
     products_col = db["products"]
     settings_col = db["settings"]
     auth_col = db["auth"]
+    calc_col = db["calc_results"]
 
 DB_ERROR_TEXT = "⚠️ Тимчасова проблема з базою даних. Спробуйте ще раз через кілька секунд."
 
@@ -74,17 +62,41 @@ async def db_call(coro, default=None):
         logger.exception("MongoDB error")
         return default
 
+# ---------------------------------------------------------------------------
+# Auth. Кешуємо авторизованих юзерів у пам'яті процесу, щоб уникнути ситуації,
+# коли одразу після успішного логіну наступний read з MongoDB (наприклад, з
+# secondary-репліки, яка ще не встигла реплікувати запис) не знаходить щойно
+# створений документ і бот знову просить пароль. Кеш заповнюється при старті
+# і оновлюється відразу після кожної успішної авторизації.
+# ---------------------------------------------------------------------------
+authorized_uids: set[int] = set()
+
+async def load_authorized_uids():
+    global authorized_uids
+    try:
+        docs = await auth_col.find({}, {"uid": 1}).to_list(length=None)
+        authorized_uids = {d["uid"] for d in docs}
+        logger.info("Завантажено %d авторизованих користувачів у кеш", len(authorized_uids))
+    except PyMongoError:
+        logger.exception("Не вдалось завантажити список авторизованих користувачів")
+
 async def is_authorized(uid: int):
+    if uid in authorized_uids:
+        return True
     try:
         doc = await auth_col.find_one({"uid": uid})
     except PyMongoError:
         logger.exception("MongoDB error in is_authorized")
         return None
-    return doc is not None
+    if doc is not None:
+        authorized_uids.add(uid)
+        return True
+    return False
 
 async def authorize(uid: int) -> bool:
     try:
         await auth_col.update_one({"uid": uid}, {"$set": {"uid": uid}}, upsert=True)
+        authorized_uids.add(uid)
         return True
     except PyMongoError:
         logger.exception("MongoDB error in authorize")
@@ -117,6 +129,35 @@ async def get_all_products() -> list:
     cursor = products_col.find({}, {"_id": 0}).sort("id", -1)
     return await db_call(cursor.to_list(length=None), default=[]) or []
 
+# ---------------------------------------------------------------------------
+# Калькулятор: налаштування (ціна доставки за 1 кг, курс юаня, курс долара)
+# ---------------------------------------------------------------------------
+async def get_calc_settings() -> dict:
+    doc = await db_call(settings_col.find_one({"_id": "calc_settings"}))
+    defaults = {"price_per_kg": 0.0, "yuan_rate": 0.0, "usd_rate": 0.0}
+    if doc:
+        for k in defaults:
+            if k in doc:
+                defaults[k] = doc[k]
+    return defaults
+
+async def save_calc_setting(field: str, value: float):
+    await db_call(settings_col.update_one({"_id": "calc_settings"}, {"$set": {field: value}}, upsert=True))
+
+async def next_calc_id() -> int:
+    doc = await db_call(calc_col.find_one(sort=[("id", -1)]))
+    return (doc["id"] + 1) if doc else 1
+
+async def add_calc(record: dict):
+    await db_call(calc_col.insert_one(record))
+
+async def get_all_calcs() -> list:
+    cursor = calc_col.find({}, {"_id": 0}).sort("id", -1)
+    return await db_call(cursor.to_list(length=None), default=[]) or []
+
+async def delete_calc(cid: int):
+    await db_call(calc_col.delete_one({"id": cid}))
+
 def parse_float(val) -> float:
     try:
         return float(str(val).replace(",", ".").strip())
@@ -128,15 +169,6 @@ def parse_int(val) -> int:
         return int(str(val).strip())
     except (ValueError, TypeError):
         return 0
-
-async def upload_photo_to_cloudinary(bot: Bot, file_id: str) -> str:
-    buf = io.BytesIO()
-    await bot.download(file_id, destination=buf)
-    buf.seek(0)
-    result = await asyncio.to_thread(
-        cloudinary.uploader.upload, buf, folder="products"
-    )
-    return result["secure_url"]
 
 def fmt_product(p: dict) -> str:
     cost = parse_float(p.get("cost_price", 0))
@@ -160,6 +192,16 @@ def fmt_product(p: dict) -> str:
         f"📦 На складі: *{parse_int(p.get('stock_qty',0))} шт*",
     ]
     return "\n".join(lines)
+
+def fmt_calc(c: dict) -> str:
+    return (
+        f"*№{c.get('id')} — {c.get('name','')}*\n\n"
+        f"💴 Ціна товару: *{c.get('price_yuan',0):,.2f} ¥*\n"
+        f"⚖️ Вага: *{c.get('weight_kg',0):,.2f} кг*\n"
+        f"🚚 Доставка: *{c.get('delivery_cost_uah',0):,.0f} грн*\n"
+        f"💰 Собівартість: *{c.get('cost_price_uah',0):,.0f} грн* "
+        f"(*{c.get('cost_price_usd',0):,.2f} $*)"
+    )
 
 class Auth(StatesGroup):
     waiting_password = State()
@@ -195,11 +237,20 @@ class AddCategory(StatesGroup):
 class DelCategory(StatesGroup):
     choosing = State()
 
+class CalcSettingsEdit(StatesGroup):
+    typing = State()
+
+class CalcProduct(StatesGroup):
+    name       = State()
+    price_yuan = State()
+    weight     = State()
+
 def kb_main() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="➕ Новий товар"), KeyboardButton(text="📋 Всі товари")],
         [KeyboardButton(text="🔍 За назвою"), KeyboardButton(text="🔠 За артикулом")],
         [KeyboardButton(text="🏷 За категорією"), KeyboardButton(text="⚙️ Категорії")],
+        [KeyboardButton(text="🧮 Калькулятор")],
     ], resize_keyboard=True)
 
 def kb_cancel() -> ReplyKeyboardMarkup:
@@ -218,6 +269,14 @@ def kb_from_list(items: list, with_manual=False) -> ReplyKeyboardMarkup:
     extra.append(KeyboardButton(text="❌ Скасувати"))
     rows.append(extra)
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+def kb_calc_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="➕ Порахувати товар")],
+        [KeyboardButton(text="📄 Мої розрахунки")],
+        [KeyboardButton(text="⚙️ Налаштування калькулятора")],
+        [KeyboardButton(text="◀️ Головне меню")],
+    ], resize_keyboard=True)
 
 def ikb_product_actions(pid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -268,6 +327,24 @@ def ikb_categories_settings() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🗑 Видалити категорію", callback_data="cfg:del_cat")],
     ])
 
+def ikb_calc_settings() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💴 Змінити ціну доставки за 1 кг", callback_data="calcset:price_per_kg")],
+        [InlineKeyboardButton(text="💱 Змінити курс юаня", callback_data="calcset:yuan_rate")],
+        [InlineKeyboardButton(text="💵 Змінити курс долара", callback_data="calcset:usd_rate")],
+    ])
+
+def ikb_calc_actions(cid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Видалити", callback_data=f"delcalc:{cid}")],
+    ])
+
+CALC_SETTING_LABELS = {
+    "price_per_kg": "ціну доставки за 1 кг (грн)",
+    "yuan_rate": "курс юаня (грн за 1¥)",
+    "usd_rate": "курс долара (грн за 1$)",
+}
+
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
 dp  = Dispatcher(storage=MemoryStorage())
 
@@ -317,6 +394,11 @@ async def check_password(msg: Message, state: FSMContext):
     else:
         await msg.answer("❌ Невірний пароль. Спробуй ще раз:")
 
+@dp.message(F.text == "◀️ Головне меню")
+async def back_to_main(msg: Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("👋 *Товари*\n\nОбери дію:", reply_markup=kb_main())
+
 @dp.message(F.text == "➕ Новий товар")
 async def new_product_start(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
@@ -330,17 +412,14 @@ async def ap_photo_cancel(msg: Message, state: FSMContext):
 
 @dp.message(AddProduct.photo, F.photo)
 async def ap_photo(msg: Message, state: FSMContext):
-    wait_msg = await msg.answer("⏳ Завантажую фото...")
-    try:
-        url = await upload_photo_to_cloudinary(bot, msg.photo[-1].file_id)
-    except Exception:
-        logger.exception("Cloudinary upload failed")
-        await wait_msg.delete()
-        return await msg.answer("⚠️ Не вдалось завантажити фото. Спробуйте ще раз:", reply_markup=kb_cancel())
-    await wait_msg.delete()
-    await state.update_data(photo_url=url)
+    # Фото нікуди не завантажуємо - зберігаємо лише file_id, який Telegram
+    # вже назавжди зберігає на своїх серверах. Саме цей ідентифікатор і
+    # записується у MongoDB як "фото в БД" - без Cloudinary та без важких
+    # base64-блобів у документах.
+    file_id = msg.photo[-1].file_id
+    await state.update_data(photo_id=file_id)
     await state.set_state(AddProduct.name)
-    await msg.answer("✅ Фото завантажено.\n\n📝 Введіть *назву товару*:", reply_markup=kb_cancel())
+    await msg.answer("✅ Фото збережено.\n\n📝 Введіть *назву товару*:", reply_markup=kb_cancel())
 
 @dp.message(AddProduct.photo)
 async def ap_photo_invalid(msg: Message, state: FSMContext):
@@ -447,7 +526,7 @@ async def ap_stock_qty(msg: Message, state: FSMContext):
     await state.clear()
     product = {
         "id":         await next_product_id(),
-        "photo_url":  fd.get("photo_url", ""),
+        "photo_id":   fd.get("photo_id", ""),
         "name":       fd.get("name", ""),
         "description": fd.get("description", ""),
         "sku":        fd.get("sku", ""),
@@ -467,7 +546,7 @@ async def ap_stock_qty(msg: Message, state: FSMContext):
 
     await add_product(product)
     await msg.answer_photo(
-        photo=product["photo_url"],
+        photo=product["photo_id"],
         caption=f"✅ *Товар додано!*\n\n{fmt_product(product)}",
         reply_markup=kb_main(),
     )
@@ -536,7 +615,7 @@ async def view_product(cb: CallbackQuery):
             return await cb.answer("Не знайдено!", show_alert=True)
         await cb.message.delete()
         await cb.message.answer_photo(
-            photo=product.get("photo_url") or None,
+            photo=product.get("photo_id") or None,
             caption=fmt_product(product),
             reply_markup=ikb_product_actions(pid),
         )
@@ -644,7 +723,7 @@ async def edit_field_save(msg: Message, state: FSMContext):
     product = await get_product(pid)
     if product:
         await msg.answer_photo(
-            photo=product.get("photo_url") or None,
+            photo=product.get("photo_id") or None,
             caption=f"✅ Оновлено!\n\n{fmt_product(product)}",
             reply_markup=kb_main(),
         )
@@ -673,18 +752,11 @@ async def edit_photo_save(msg: Message, state: FSMContext):
         return
     pid = fd["edit_pid"]
     await state.clear()
-    wait_msg = await msg.answer("⏳ Завантажую фото...")
-    try:
-        url = await upload_photo_to_cloudinary(bot, msg.photo[-1].file_id)
-    except Exception:
-        logger.exception("Cloudinary upload failed")
-        await wait_msg.delete()
-        return await msg.answer("⚠️ Не вдалось завантажити фото.", reply_markup=kb_main())
-    await wait_msg.delete()
-    await update_product(pid, {"photo_url": url})
+    file_id = msg.photo[-1].file_id
+    await update_product(pid, {"photo_id": file_id})
     product = await get_product(pid)
     if product:
-        await msg.answer_photo(photo=url, caption=f"✅ Фото оновлено!\n\n{fmt_product(product)}", reply_markup=kb_main())
+        await msg.answer_photo(photo=file_id, caption=f"✅ Фото оновлено!\n\n{fmt_product(product)}", reply_markup=kb_main())
     else:
         await msg.answer("Товар не знайдено.", reply_markup=kb_main())
 
@@ -811,6 +883,157 @@ async def cfg_del_cat_do(msg: Message, state: FSMContext):
     else:
         await msg.answer("Не знайдено.", reply_markup=kb_main())
 
+# ---------------------------------------------------------------------------
+# Калькулятор
+# ---------------------------------------------------------------------------
+@dp.message(F.text == "🧮 Калькулятор")
+async def calc_menu(msg: Message, state: FSMContext):
+    if not await require_auth(msg, state): return
+    await state.clear()
+    await msg.answer("🧮 *Калькулятор*\n\nОбери дію:", reply_markup=kb_calc_menu())
+
+@dp.message(F.text == "⚙️ Налаштування калькулятора")
+async def calc_settings_menu(msg: Message, state: FSMContext):
+    if not await require_auth(msg, state): return
+    s = await get_calc_settings()
+    text = (
+        "⚙️ *Налаштування калькулятора*\n\n"
+        f"💴 Ціна доставки за 1 кг: *{s['price_per_kg']:.2f} грн*\n"
+        f"💱 Курс юаня: *{s['yuan_rate']:.2f} грн*\n"
+        f"💵 Курс долара: *{s['usd_rate']:.2f} грн*\n\n"
+        "Обери, що змінити:"
+    )
+    await msg.answer(text, reply_markup=ikb_calc_settings())
+
+@dp.callback_query(F.data.startswith("calcset:"))
+async def calcset_choose(cb: CallbackQuery, state: FSMContext):
+    try:
+        field = cb.data.split(":", 1)[1]
+        await state.set_state(CalcSettingsEdit.typing)
+        await state.update_data(calcset_field=field)
+        await cb.message.answer(
+            f"Введіть нове значення для {CALC_SETTING_LABELS.get(field, field)}:",
+            reply_markup=kb_cancel(),
+        )
+        await cb.answer()
+    except Exception:
+        logger.exception("calcset_choose failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.message(CalcSettingsEdit.typing)
+async def calcset_save(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+    fd = await state.get_data()
+    field = fd["calcset_field"]
+    value = parse_float(msg.text)
+    if value <= 0:
+        return await msg.answer("⚠️ Введіть додатнє число, наприклад *12.5*:", reply_markup=kb_cancel())
+    await state.clear()
+    await save_calc_setting(field, value)
+    s = await get_calc_settings()
+    text = (
+        "✅ Збережено!\n\n"
+        f"💴 Ціна доставки за 1 кг: *{s['price_per_kg']:.2f} грн*\n"
+        f"💱 Курс юаня: *{s['yuan_rate']:.2f} грн*\n"
+        f"💵 Курс долара: *{s['usd_rate']:.2f} грн*"
+    )
+    await msg.answer(text, reply_markup=kb_calc_menu())
+
+@dp.message(F.text == "➕ Порахувати товар")
+async def calc_start(msg: Message, state: FSMContext):
+    if not await require_auth(msg, state): return
+    s = await get_calc_settings()
+    if not all(s.values()):
+        return await msg.answer(
+            "⚠️ Спочатку задайте ціну доставки, курс юаня і курс долара "
+            "в *⚙️ Налаштування калькулятора*.",
+            reply_markup=kb_calc_menu(),
+        )
+    await state.set_state(CalcProduct.name)
+    await msg.answer("📝 Введіть *назву товару*:", reply_markup=kb_cancel())
+
+@dp.message(CalcProduct.name)
+async def calc_name(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+    await state.update_data(calc_name=msg.text.strip())
+    await state.set_state(CalcProduct.price_yuan)
+    await msg.answer("💴 Введіть *ціну товару в юанях*:", reply_markup=kb_cancel())
+
+@dp.message(CalcProduct.price_yuan)
+async def calc_price(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+    value = parse_float(msg.text)
+    if value <= 0:
+        return await msg.answer("⚠️ Введіть додатнє число, наприклад *25.5*:", reply_markup=kb_cancel())
+    await state.update_data(calc_price_yuan=value)
+    await state.set_state(CalcProduct.weight)
+    await msg.answer("⚖️ Введіть *вагу товару* (кг):", reply_markup=kb_cancel())
+
+@dp.message(CalcProduct.weight)
+async def calc_weight(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+    weight = parse_float(msg.text)
+    if weight <= 0:
+        return await msg.answer("⚠️ Введіть додатнє число, наприклад *0.5*:", reply_markup=kb_cancel())
+
+    fd = await state.get_data()
+    name = fd["calc_name"]
+    price_yuan = fd["calc_price_yuan"]
+    await state.clear()
+
+    s = await get_calc_settings()
+    delivery_cost_uah = weight * s["price_per_kg"]
+    price_uah = price_yuan * s["yuan_rate"]
+    cost_price_uah = price_uah + delivery_cost_uah
+    cost_price_usd = cost_price_uah / s["usd_rate"] if s["usd_rate"] else 0.0
+
+    record = {
+        "id":                await next_calc_id(),
+        "name":              name,
+        "price_yuan":        price_yuan,
+        "weight_kg":         weight,
+        "delivery_cost_uah": delivery_cost_uah,
+        "cost_price_uah":    cost_price_uah,
+        "cost_price_usd":    cost_price_usd,
+        "created_at":        datetime.now().isoformat(),
+        "created_by":        msg.from_user.id,
+    }
+    await add_calc(record)
+
+    await msg.answer(fmt_calc(record), reply_markup=ikb_calc_actions(record["id"]))
+    await msg.answer("Готово ✅ Розрахунок збережено.", reply_markup=kb_calc_menu())
+
+@dp.message(F.text == "📄 Мої розрахунки")
+async def list_calcs(msg: Message, state: FSMContext):
+    if not await require_auth(msg, state): return
+    calcs = await get_all_calcs()
+    if not calcs:
+        return await msg.answer("📭 Розрахунків ще немає.", reply_markup=kb_calc_menu())
+    await msg.answer(f"📄 *Розрахунки* — {len(calcs)} шт.", reply_markup=kb_calc_menu())
+    for c in calcs:
+        await msg.answer(fmt_calc(c), reply_markup=ikb_calc_actions(c["id"]))
+
+@dp.callback_query(F.data.startswith("delcalc:"))
+async def delete_calc_cb(cb: CallbackQuery):
+    try:
+        cid = int(cb.data.split(":")[1])
+        await delete_calc(cid)
+        await cb.message.edit_text(f"🗑 Розрахунок №{cid} видалено.")
+        await cb.answer("Видалено!")
+    except Exception:
+        logger.exception("delete_calc_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
 from aiohttp import web
 
 async def health(request):
@@ -828,6 +1051,8 @@ async def main():
     except Exception:
         logger.exception("MongoDB connection FAILED at startup")
 
+    await load_authorized_uids()
+
     app = web.Application()
     app.router.add_get("/", health)
     runner = web.AppRunner(app)
@@ -836,7 +1061,7 @@ async def main():
     await site.start()
 
     await bot.delete_webhook(drop_pending_updates=True)
-    logger.info("Бот товарів запущено (MongoDB + Cloudinary)...")
+    logger.info("Бот товарів запущено (MongoDB, без Cloudinary)...")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
