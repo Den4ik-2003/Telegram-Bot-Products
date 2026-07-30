@@ -209,6 +209,10 @@ def parse_int(val) -> int:
     except (ValueError, TypeError):
         return 0
 
+def is_valid_link(val: str) -> bool:
+    val = (val or "").strip().lower()
+    return val.startswith("http://") or val.startswith("https://")
+
 # ---------------------------------------------------------------------------
 # Статуси товару
 # ---------------------------------------------------------------------------
@@ -252,6 +256,8 @@ def fmt_product(p: dict) -> str:
         f"📈 Маржа: *{margin:,.0f} грн*",
         f"📦 На складі: *{parse_int(p.get('stock_qty',0))} шт*",
     ]
+    if p.get("link"):
+        lines.append("🔗 Посилання на товар додано (кнопка нижче)")
     return "\n".join(lines)
 
 DELIVERY_METHOD_LABELS = {"avia": "✈️ Авіа", "sea": "🚢 Море"}
@@ -278,6 +284,7 @@ class AddProduct(StatesGroup):
     photo         = State()
     name          = State()
     description   = State()
+    link          = State()
     sku           = State()
     category      = State()
     category_manual = State()
@@ -360,19 +367,24 @@ def kb_calc_menu() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="◀️ Головне меню")],
     ], resize_keyboard=True)
 
-def ikb_product_actions(pid: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+def ikb_product_actions(pid: int, product: dict | None = None) -> InlineKeyboardMarkup:
+    rows = [
         [InlineKeyboardButton(text="✏️ Редагувати", callback_data=f"edit:{pid}")],
         [InlineKeyboardButton(text="📌 Статус", callback_data=f"status:{pid}")],
         [InlineKeyboardButton(text="📷 Змінити фото", callback_data=f"editphoto:{pid}")],
-        [InlineKeyboardButton(text="✅ Продано", callback_data=f"sold:{pid}")],
-        [InlineKeyboardButton(text="🗑 Видалити", callback_data=f"delete:{pid}")],
-        [InlineKeyboardButton(text="◀️ До списку", callback_data="back_to_list")],
-    ])
+    ]
+    link = (product or {}).get("link", "")
+    if is_valid_link(link):
+        rows.append([InlineKeyboardButton(text="🔗 Посилання на товар", url=link.strip())])
+    rows.append([InlineKeyboardButton(text="✅ Продано", callback_data=f"sold:{pid}")])
+    rows.append([InlineKeyboardButton(text="🗑 Видалити", callback_data=f"delete:{pid}")])
+    rows.append([InlineKeyboardButton(text="◀️ До списку", callback_data="back_to_list")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def ikb_edit_fields(pid: int) -> InlineKeyboardMarkup:
     fields = [
         ("name", "Назва"), ("description", "Опис"),
+        ("link", "Посилання"),
         ("sku", "Артикул"), ("category", "Категорія"),
         ("size", "Розмір"), ("color", "Колір"),
         ("rating", "Оцінка (0-10)"),
@@ -588,6 +600,26 @@ async def ap_description(msg: Message, state: FSMContext):
     if msg.text == "❌ Скасувати":
         await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
     await state.update_data(description="" if msg.text == "⏩ Пропустити" else msg.text.strip())
+    await state.set_state(AddProduct.link)
+    await msg.answer(
+        "🔗 Введіть *посилання на товар* (наприклад https://...), можна пропустити:",
+        reply_markup=kb_skip_cancel(),
+    )
+
+@dp.message(AddProduct.link)
+async def ap_link(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
+    if msg.text == "⏩ Пропустити":
+        await state.update_data(link="")
+    else:
+        value = msg.text.strip()
+        if not is_valid_link(value):
+            return await msg.answer(
+                "⚠️ Посилання має починатись з *http://* або *https://*, або натисніть «⏩ Пропустити»:",
+                reply_markup=kb_skip_cancel(),
+            )
+        await state.update_data(link=value)
     await state.set_state(AddProduct.sku)
     await msg.answer("🔖 Введіть *артикул (SKU)*:", reply_markup=kb_cancel())
 
@@ -696,6 +728,7 @@ async def ap_stock_qty(msg: Message, state: FSMContext):
         "photo_id":   fd.get("photo_id", ""),
         "name":       fd.get("name", ""),
         "description": fd.get("description", ""),
+        "link":       fd.get("link", ""),
         "sku":        fd.get("sku", ""),
         "category":   fd.get("category", ""),
         "size":       fd.get("size", ""),
@@ -717,8 +750,9 @@ async def ap_stock_qty(msg: Message, state: FSMContext):
     await msg.answer_photo(
         photo=product["photo_id"],
         caption=f"✅ *Товар додано!*\n\n{fmt_product(product)}",
-        reply_markup=kb_main(),
+        reply_markup=ikb_product_actions(product["id"], product),
     )
+    await msg.answer("Готово ✅", reply_markup=kb_main())
 
 @dp.message(F.text == "📋 Всі товари")
 async def list_products(msg: Message, state: FSMContext):
@@ -786,7 +820,7 @@ async def view_product(cb: CallbackQuery):
         await cb.message.answer_photo(
             photo=product.get("photo_id") or None,
             caption=fmt_product(product),
-            reply_markup=ikb_product_actions(pid),
+            reply_markup=ikb_product_actions(pid, product),
         )
         await cb.answer()
     except Exception:
@@ -889,7 +923,7 @@ async def set_status_cb(cb: CallbackQuery):
         if product:
             await cb.message.answer(
                 f"✅ Статус оновлено: {meta['emoji']} {meta['label']}\n\n{fmt_product(product)}",
-                reply_markup=ikb_product_actions(pid),
+                reply_markup=ikb_product_actions(pid, product),
             )
         await cb.answer("Статус оновлено")
     except Exception:
@@ -905,7 +939,8 @@ async def edit_field_choose(cb: CallbackQuery, state: FSMContext):
         _, pid_s, field = cb.data.split(":", 2)
         pid = int(pid_s)
         labels = {
-            "name": "Назву", "description": "Опис", "sku": "Артикул",
+            "name": "Назву", "description": "Опис", "link": "Посилання на товар",
+            "sku": "Артикул",
             "category": "Категорію", "size": "Розмір", "color": "Колір",
             "rating": "Оцінку (0-10)",
             "cost_price": "Собівартість (грн)", "sale_price": "Ціну продажу (грн)",
@@ -913,7 +948,12 @@ async def edit_field_choose(cb: CallbackQuery, state: FSMContext):
         }
         await state.set_state(EditField.typing)
         await state.update_data(edit_pid=pid, edit_field=field)
-        await cb.message.answer(f"Введіть нове значення для *{labels.get(field, field)}*:", reply_markup=kb_cancel())
+        hint = ""
+        if field == "link":
+            hint = "\n_Має починатись з http:// або https://. Щоб прибрати посилання — надішліть «-»._"
+        elif field in ("description",):
+            hint = "\n_Щоб прибрати опис — надішліть «-»._"
+        await cb.message.answer(f"Введіть нове значення для *{labels.get(field, field)}*:{hint}", reply_markup=kb_cancel())
         await cb.answer()
     except Exception:
         logger.exception("edit_field_choose failed")
@@ -929,17 +969,21 @@ async def edit_field_save(msg: Message, state: FSMContext):
     fd = await state.get_data()
     pid, field = fd["edit_pid"], fd["edit_field"]
     value = msg.text.strip()
-    if field in ("cost_price", "sale_price"):
+
+    # Поля, які можна очистити, надіславши "-"
+    if field in ("description", "link") and value == "-":
+        value = ""
+    elif field in ("cost_price", "sale_price"):
         try:
             float(value.replace(",", "."))
         except ValueError:
             return await msg.answer("⚠️ Введіть число:", reply_markup=kb_cancel())
-    if field == "stock_qty":
+    elif field == "stock_qty":
         try:
             int(value)
         except ValueError:
             return await msg.answer("⚠️ Введіть ціле число:", reply_markup=kb_cancel())
-    if field == "rating":
+    elif field == "rating":
         try:
             rv = int(value)
         except ValueError:
@@ -947,6 +991,12 @@ async def edit_field_save(msg: Message, state: FSMContext):
         if not (0 <= rv <= 10):
             return await msg.answer("⚠️ Оцінка має бути від 0 до 10:", reply_markup=kb_cancel())
         value = str(rv)
+    elif field == "link" and value and not is_valid_link(value):
+        return await msg.answer(
+            "⚠️ Посилання має починатись з *http://* або *https://*, або надішліть «-», щоб прибрати його:",
+            reply_markup=kb_cancel(),
+        )
+
     await state.clear()
     await update_product(pid, {field: value})
     if field == "category":
@@ -959,8 +1009,9 @@ async def edit_field_save(msg: Message, state: FSMContext):
         await msg.answer_photo(
             photo=product.get("photo_id") or None,
             caption=f"✅ Оновлено!\n\n{fmt_product(product)}",
-            reply_markup=kb_main(),
+            reply_markup=ikb_product_actions(pid, product),
         )
+        await msg.answer("Готово ✅", reply_markup=kb_main())
     else:
         await msg.answer("Товар не знайдено.", reply_markup=kb_main())
 
@@ -990,7 +1041,11 @@ async def edit_photo_save(msg: Message, state: FSMContext):
     await update_product(pid, {"photo_id": file_id})
     product = await get_product(pid)
     if product:
-        await msg.answer_photo(photo=file_id, caption=f"✅ Фото оновлено!\n\n{fmt_product(product)}", reply_markup=kb_main())
+        await msg.answer_photo(
+            photo=file_id,
+            caption=f"✅ Фото оновлено!\n\n{fmt_product(product)}",
+            reply_markup=ikb_product_actions(pid, product),
+        )
     else:
         await msg.answer("Товар не знайдено.", reply_markup=kb_main())
 
@@ -1132,7 +1187,7 @@ async def export_products_csv(msg: Message, state: FSMContext):
         writer = csv.writer(output)
         writer.writerow([
             "id", "name", "sku", "category", "size", "color",
-            "description", "rating", "status", "cost_price", "sale_price",
+            "description", "link", "rating", "status", "cost_price", "sale_price",
             "stock_qty", "created_at",
         ])
         for p in products:
@@ -1141,7 +1196,7 @@ async def export_products_csv(msg: Message, state: FSMContext):
             writer.writerow([
                 p.get("id", ""), p.get("name", ""), p.get("sku", ""),
                 p.get("category", ""), p.get("size", ""), p.get("color", ""),
-                p.get("description", ""), p.get("rating", "0"), status_label,
+                p.get("description", ""), p.get("link", ""), p.get("rating", "0"), status_label,
                 p.get("cost_price", ""),
                 p.get("sale_price", ""), p.get("stock_qty", ""), p.get("created_at", ""),
             ])
