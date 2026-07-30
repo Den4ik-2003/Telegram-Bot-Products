@@ -27,9 +27,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("products_bot")
 
-BOT_TOKEN    = os.environ["BOT_TOKEN"]
-BOT_PASSWORD = os.environ["BOT_PASSWORD"]
-MONGO_URI    = os.environ["MONGO_URI"]
+BOT_TOKEN     = os.environ["BOT_TOKEN"]
+BOT_PASSWORD  = os.environ["BOT_PASSWORD"]
+CALC_PASSWORD = os.environ["CALC_PASSWORD"]  # пароль з доступом ЛИШЕ до розділу "Калькулятор"
+MONGO_URI     = os.environ["MONGO_URI"]
 
 mongo_client: AsyncIOMotorClient | None = None
 db = None
@@ -38,9 +39,10 @@ settings_col = None
 auth_col = None
 calc_col = None
 users_col = None
+baskets_col = None
 
 def init_mongo():
-    global mongo_client, db, products_col, settings_col, auth_col, calc_col, users_col
+    global mongo_client, db, products_col, settings_col, auth_col, calc_col, users_col, baskets_col
     mongo_client = AsyncIOMotorClient(
         MONGO_URI,
         serverSelectionTimeoutMS=10000,
@@ -56,6 +58,7 @@ def init_mongo():
     auth_col = db["auth"]
     calc_col = db["calc_results"]
     users_col = db["users"]
+    baskets_col = db["baskets"]
 
 DB_ERROR_TEXT = "⚠️ Тимчасова проблема з базою даних. Спробуйте ще раз через кілька секунд."
 GENERIC_ERROR_TEXT = "⚠️ Сталася помилка під час обробки дії. Спробуйте ще раз або поверніться в меню нижче."
@@ -67,34 +70,48 @@ async def db_call(coro, default=None):
         logger.exception("MongoDB error")
         return default
 
-authorized_uids: set[int] = set()
+# ---------------------------------------------------------------------------
+# Авторизація / ролі
+#
+# Ролі:
+#   "full" — повний доступ (усі розділи: товари + калькулятор)
+#   "calc" — доступ ЛИШЕ до розділу "Калькулятор" (авторизація через CALC_PASSWORD)
+# ---------------------------------------------------------------------------
 
-async def load_authorized_uids():
-    global authorized_uids
+user_roles: dict[int, str] = {}  # uid -> "full" | "calc"  (кеш у пам'яті)
+
+async def load_user_roles():
+    global user_roles
     try:
-        docs = await auth_col.find({}, {"uid": 1}).to_list(length=None)
-        authorized_uids = {d["uid"] for d in docs}
-        logger.info("Завантажено %d авторизованих користувачів у кеш", len(authorized_uids))
+        docs = await auth_col.find({}, {"uid": 1, "role": 1}).to_list(length=None)
+        user_roles = {d["uid"]: d.get("role", "full") for d in docs}
+        logger.info("Завантажено %d авторизованих користувачів у кеш", len(user_roles))
     except PyMongoError:
         logger.exception("Не вдалось завантажити список авторизованих користувачів")
 
-async def is_authorized(uid: int):
-    if uid in authorized_uids:
-        return True
+async def get_role(uid: int):
+    """Повертає 'full' | 'calc' | None (не авторизований) | 'ERROR' (помилка БД)."""
+    if uid in user_roles:
+        return user_roles[uid]
     try:
         doc = await auth_col.find_one({"uid": uid})
     except PyMongoError:
-        logger.exception("MongoDB error in is_authorized")
-        return None
+        logger.exception("MongoDB error in get_role")
+        return "ERROR"
     if doc is not None:
-        authorized_uids.add(uid)
-        return True
-    return False
+        role = doc.get("role", "full")
+        user_roles[uid] = role
+        return role
+    return None
 
-async def authorize(uid: int) -> bool:
+def cached_role(uid: int) -> str:
+    """Синхронний доступ до вже відомої ролі (для внутрішньої навігації всередині FSM)."""
+    return user_roles.get(uid, "full")
+
+async def authorize(uid: int, role: str = "full") -> bool:
     try:
-        await auth_col.update_one({"uid": uid}, {"$set": {"uid": uid}}, upsert=True)
-        authorized_uids.add(uid)
+        await auth_col.update_one({"uid": uid}, {"$set": {"uid": uid, "role": role}}, upsert=True)
+        user_roles[uid] = role
         return True
     except PyMongoError:
         logger.exception("MongoDB error in authorize")
@@ -173,6 +190,8 @@ async def update_calc(cid: int, fields: dict):
 
 async def delete_calc(cid: int):
     await db_call(calc_col.delete_one({"id": cid}))
+    # прибираємо посилання на цей розрахунок з усіх кошиків, щоб не лишалось "мертвих" id
+    await db_call(baskets_col.update_many({}, {"$pull": {"calc_ids": cid}}))
 
 async def recalc_calc_costs(cid: int):
     record = await get_calc(cid)
@@ -197,6 +216,45 @@ async def recalc_calc_costs(cid: int):
     }
     await update_calc(cid, fields)
     return await get_calc(cid)
+
+# ---------------------------------------------------------------------------
+# Кошики (бюджети)
+#
+# У кошику зберігаються ЛИШЕ id розрахунків (calc_ids), а не копії самих
+# товарів — так один кошик займає мінімум місця в базі, і кошиків можна
+# створювати скільки завгодно.
+# ---------------------------------------------------------------------------
+
+async def next_basket_id() -> int:
+    doc = await db_call(baskets_col.find_one(sort=[("id", -1)]))
+    return (doc["id"] + 1) if doc else 1
+
+async def add_basket(basket: dict):
+    await db_call(baskets_col.insert_one(basket))
+
+async def get_basket(bid: int) -> dict | None:
+    return await db_call(baskets_col.find_one({"id": bid}, {"_id": 0}))
+
+async def get_all_baskets() -> list:
+    cursor = baskets_col.find({}, {"_id": 0}).sort("id", -1)
+    return await db_call(cursor.to_list(length=None), default=[]) or []
+
+async def delete_basket(bid: int):
+    await db_call(baskets_col.delete_one({"id": bid}))
+
+async def basket_add_calc(bid: int, cid: int):
+    await db_call(baskets_col.update_one({"id": bid}, {"$addToSet": {"calc_ids": cid}}))
+
+async def basket_remove_calc(bid: int, cid: int):
+    await db_call(baskets_col.update_one({"id": bid}, {"$pull": {"calc_ids": cid}}))
+
+async def calcs_map_by_id(ids: list) -> dict:
+    ids = list(set(ids))
+    if not ids:
+        return {}
+    cursor = calc_col.find({"id": {"$in": ids}}, {"_id": 0})
+    docs = await db_call(cursor.to_list(length=None), default=[]) or []
+    return {d["id"]: d for d in docs}
 
 def parse_float(val) -> float:
     try:
@@ -247,6 +305,26 @@ def fmt_calc(c: dict) -> str:
     ]
     if c.get("link"):
         lines.append("🔗 Посилання на товар додано (кнопка нижче)")
+    return "\n".join(lines)
+
+def fmt_basket(b: dict, calcs_by_id: dict) -> str:
+    items = [calcs_by_id[cid] for cid in b.get("calc_ids", []) if cid in calcs_by_id]
+    total = sum(parse_float(c.get("cost_price_uah", 0)) for c in items)
+    budget = parse_float(b.get("budget", 0))
+    remaining = budget - total
+    status = "✅ У межах бюджету" if remaining >= 0 else "⚠️ Бюджет перевищено"
+    lines = [
+        f"*🧺 Кошик №{b.get('id')} — {b.get('name','')}*",
+        f"💰 Бюджет: *{budget:,.0f} грн*",
+        f"🧾 Витрачено: *{total:,.0f} грн*",
+        f"{status} — залишок *{remaining:,.0f} грн*",
+        f"📦 Товарів у кошику: *{len(items)}*",
+    ]
+    if items:
+        lines.append("")
+        for c in items:
+            cost = parse_float(c.get("cost_price_uah", 0))
+            lines.append(f"• №{c.get('id')} {c.get('name','')} — {cost:,.0f} грн")
     return "\n".join(lines)
 
 def build_calc_csv(calcs: list) -> bytes:
@@ -302,6 +380,10 @@ class SendCalc(StatesGroup):
     action_choice  = State()
     waiting_username = State()
 
+class BasketCreate(StatesGroup):
+    name   = State()
+    budget = State()
+
 def kb_main() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="➕ Новий товар"), KeyboardButton(text="📋 Всі товари")],
@@ -323,14 +405,17 @@ def kb_delivery_method() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="❌ Скасувати")],
     ], resize_keyboard=True)
 
-def kb_calc_menu() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(keyboard=[
+def kb_calc_menu(role: str = "full") -> ReplyKeyboardMarkup:
+    rows = [
         [KeyboardButton(text="➕ Порахувати товар")],
         [KeyboardButton(text="📄 Мої розрахунки")],
+        [KeyboardButton(text="🧺 Кошики")],
         [KeyboardButton(text="📤 Переслати/Зберегти")],
         [KeyboardButton(text="⚙️ Налаштування калькулятора")],
-        [KeyboardButton(text="◀️ Головне меню")],
-    ], resize_keyboard=True)
+    ]
+    if role == "full":
+        rows.append([KeyboardButton(text="◀️ Головне меню")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 def ikb_product_actions(pid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -366,7 +451,10 @@ def ikb_calc_settings() -> InlineKeyboardMarkup:
     ])
 
 def ikb_calc_actions(cid: int, calc: dict | None = None) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text="✏️ Редагувати", callback_data=f"editcalc:{cid}")]]
+    rows = [
+        [InlineKeyboardButton(text="🧺 У кошик", callback_data=f"tobasket:{cid}")],
+        [InlineKeyboardButton(text="✏️ Редагувати", callback_data=f"editcalc:{cid}")],
+    ]
     link = (calc or {}).get("link", "")
     if is_valid_link(link):
         rows.append([InlineKeyboardButton(text="🔗 Посилання на товар", url=link.strip())])
@@ -414,6 +502,68 @@ def ikb_send_calc_action() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="❌ Скасувати", callback_data="calcaction:cancel")],
     ])
 
+# ---- Клавіатури кошиків ----------------------------------------------------
+
+def ikb_baskets_list(baskets: list, calcs_by_id: dict) -> InlineKeyboardMarkup:
+    rows = []
+    for b in baskets:
+        items = [calcs_by_id[cid] for cid in b.get("calc_ids", []) if cid in calcs_by_id]
+        total = sum(parse_float(c.get("cost_price_uah", 0)) for c in items)
+        budget = parse_float(b.get("budget", 0))
+        mark = "✅" if total <= budget else "⚠️"
+        label = f"{mark} №{b['id']} {b.get('name','')[:18]} — {total:,.0f}/{budget:,.0f}грн"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"basket_view:{b['id']}")])
+    rows.append([InlineKeyboardButton(text="➕ Новий кошик", callback_data="basket_new")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def ikb_basket_actions(bid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Додати товар", callback_data=f"basket_add:{bid}:0")],
+        [InlineKeyboardButton(text="➖ Прибрати товар", callback_data=f"basket_rmlist:{bid}")],
+        [InlineKeyboardButton(text="🔄 Оновити", callback_data=f"basket_view:{bid}")],
+        [InlineKeyboardButton(text="🗑 Видалити кошик", callback_data=f"basket_del:{bid}")],
+        [InlineKeyboardButton(text="◀️ До списку кошиків", callback_data="basket_back")],
+    ])
+
+def ikb_basket_add_list(bid: int, calcs: list, in_basket: set, page: int = 0, per_page: int = 8) -> InlineKeyboardMarkup:
+    available = [c for c in calcs if c["id"] not in in_basket]
+    start = page * per_page
+    chunk = available[start:start + per_page]
+    rows = []
+    for c in chunk:
+        cost = parse_float(c.get("cost_price_uah", 0))
+        label = f"➕ №{c['id']} {c.get('name','')[:18]} — {cost:,.0f}грн"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"basket_addsel:{bid}:{c['id']}:{page}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"basket_add:{bid}:{page-1}"))
+    total_pages = max(1, (len(available) - 1) // per_page + 1) if available else 1
+    nav.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="noop"))
+    if start + per_page < len(available):
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"basket_add:{bid}:{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="✅ Готово", callback_data=f"basket_view:{bid}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def ikb_basket_remove_list(bid: int, calcs_by_id: dict) -> InlineKeyboardMarkup:
+    rows = []
+    for cid, c in calcs_by_id.items():
+        cost = parse_float(c.get("cost_price_uah", 0))
+        label = f"➖ №{c.get('id')} {c.get('name','')[:18]} — {cost:,.0f}грн"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"basket_rm:{bid}:{cid}")])
+    rows.append([InlineKeyboardButton(text="✅ Готово", callback_data=f"basket_view:{bid}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def ikb_pick_basket(cid: int, baskets: list) -> InlineKeyboardMarkup:
+    rows = []
+    for b in baskets:
+        budget = parse_float(b.get("budget", 0))
+        label = f"🧺 №{b['id']} {b.get('name','')[:18]} (бюджет {budget:,.0f}грн)"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"tobasketsel:{cid}:{b['id']}")])
+    rows.append([InlineKeyboardButton(text="➕ Новий кошик", callback_data="basket_new")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 CALC_SETTING_LABELS = {
     "price_per_kg_avia": "ціну доставки авіа за 1 кг ($)",
     "price_per_kg_sea": "ціну доставки морем за 1 кг ($)",
@@ -427,18 +577,42 @@ dp  = Dispatcher(storage=MemoryStorage())
 user_list_cache: dict = {}
 send_calc_cache: dict = {}
 
-async def require_auth(msg: Message, state: FSMContext) -> bool:
-    authorized = await is_authorized(msg.from_user.id)
-    if authorized is None:
+async def require_auth(msg: Message, state: FSMContext, need_full: bool = False):
+    """Перевіряє доступ. Повертає роль ('full'/'calc') якщо дозволено, інакше None
+    (і сам відповідає користувачу — просить пароль або повідомляє про брак доступу)."""
+    role = await get_role(msg.from_user.id)
+    if role == "ERROR":
         await msg.answer(DB_ERROR_TEXT)
+        return None
+    if role is None:
+        current_state = await state.get_state()
+        if current_state != Auth.waiting_password:
+            await state.set_state(Auth.waiting_password)
+            await msg.answer("🔒 *Доступ закритий*\n\nВведіть пароль:", reply_markup=ReplyKeyboardRemove())
+        return None
+    if need_full and role != "full":
+        await msg.answer(
+            "⛔ У вас немає доступу до цього розділу.\nВам доступний лише розділ *🧮 Калькулятор*.",
+            reply_markup=kb_calc_menu(role),
+        )
+        return None
+    return role
+
+async def require_full_cb(cb: CallbackQuery) -> bool:
+    role = await get_role(cb.from_user.id)
+    if role == "ERROR":
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
         return False
-    if authorized:
-        return True
-    current_state = await state.get_state()
-    if current_state != Auth.waiting_password:
-        await state.set_state(Auth.waiting_password)
-        await msg.answer("🔒 *Доступ закритий*\n\nВведіть пароль:", reply_markup=ReplyKeyboardRemove())
-    return False
+    if role != "full":
+        try:
+            await cb.answer("⛔ Немає доступу до цього розділу.", show_alert=True)
+        except TelegramAPIError:
+            pass
+        return False
+    return True
 
 @dp.errors()
 async def global_error_handler(event, exception=None):
@@ -472,12 +646,14 @@ async def global_error_handler(event, exception=None):
 async def cmd_start(msg: Message, state: FSMContext):
     await state.clear()
     await upsert_user(msg.from_user.id, msg.from_user.username, msg.from_user.first_name or "")
-    authorized = await is_authorized(msg.from_user.id)
-    if authorized is None:
+    role = await get_role(msg.from_user.id)
+    if role == "ERROR":
         await msg.answer(DB_ERROR_TEXT)
         return
-    if authorized:
+    if role == "full":
         await msg.answer("👋 *Товари*\n\nОбери дію:", reply_markup=kb_main())
+    elif role == "calc":
+        await msg.answer("🧮 *Калькулятор*\n\nОбери дію:", reply_markup=kb_calc_menu(role))
     else:
         await state.set_state(Auth.waiting_password)
         await msg.answer("🔒 *Доступ закритий*\n\nВведіть пароль:", reply_markup=ReplyKeyboardRemove())
@@ -485,23 +661,41 @@ async def cmd_start(msg: Message, state: FSMContext):
 @dp.message(Auth.waiting_password)
 async def check_password(msg: Message, state: FSMContext):
     if msg.text == BOT_PASSWORD:
-        ok = await authorize(msg.from_user.id)
-        if not ok:
-            await msg.answer(DB_ERROR_TEXT)
-            return
-        await state.clear()
-        await msg.answer("✅ *Пароль вірний!*\n\nОбери дію:", reply_markup=kb_main())
+        role = "full"
+    elif msg.text == CALC_PASSWORD:
+        role = "calc"
     else:
         await msg.answer("❌ Невірний пароль. Спробуй ще раз:")
+        return
+
+    ok = await authorize(msg.from_user.id, role)
+    if not ok:
+        await msg.answer(DB_ERROR_TEXT)
+        return
+    await state.clear()
+    if role == "full":
+        await msg.answer("✅ *Пароль вірний!*\n\nОбери дію:", reply_markup=kb_main())
+    else:
+        await msg.answer(
+            "✅ *Пароль вірний!*\n\nВам доступний лише розділ *🧮 Калькулятор*.",
+            reply_markup=kb_calc_menu(role),
+        )
 
 @dp.message(F.text == "◀️ Головне меню")
 async def back_to_main(msg: Message, state: FSMContext):
+    role = await require_auth(msg, state)
+    if not role:
+        return
     await state.clear()
-    await msg.answer("👋 *Товари*\n\nОбери дію:", reply_markup=kb_main())
+    if role == "full":
+        await msg.answer("👋 *Товари*\n\nОбери дію:", reply_markup=kb_main())
+    else:
+        await msg.answer("🧮 *Калькулятор*\n\nОбери дію:", reply_markup=kb_calc_menu(role))
 
 @dp.message(F.text == "➕ Новий товар")
 async def new_product_start(msg: Message, state: FSMContext):
-    if not await require_auth(msg, state): return
+    role = await require_auth(msg, state, need_full=True)
+    if not role: return
     await state.set_state(AddProduct.photo)
     await msg.answer("📷 Надішліть *фото товару*:", reply_markup=kb_cancel())
 
@@ -557,7 +751,8 @@ async def ap_cost_price(msg: Message, state: FSMContext):
 
 @dp.message(F.text == "📋 Всі товари")
 async def list_products(msg: Message, state: FSMContext):
-    if not await require_auth(msg, state): return
+    role = await require_auth(msg, state, need_full=True)
+    if not role: return
     try:
         uid = msg.from_user.id
         products = await get_all_products()
@@ -572,6 +767,8 @@ async def list_products(msg: Message, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("page:"))
 async def page_products(cb: CallbackQuery):
+    if not await require_full_cb(cb):
+        return
     try:
         uid = cb.from_user.id
         page = int(cb.data.split(":")[1])
@@ -588,6 +785,8 @@ async def page_products(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "back_to_list")
 async def back_to_list(cb: CallbackQuery):
+    if not await require_full_cb(cb):
+        return
     try:
         uid = cb.from_user.id
         products = await get_all_products()
@@ -612,6 +811,8 @@ async def noop(cb: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("view:"))
 async def view_product(cb: CallbackQuery):
+    if not await require_full_cb(cb):
+        return
     try:
         pid = int(cb.data.split(":")[1])
         product = await get_product(pid)
@@ -633,6 +834,8 @@ async def view_product(cb: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("sold:"))
 async def sold_product(cb: CallbackQuery):
+    if not await require_full_cb(cb):
+        return
     try:
         pid = int(cb.data.split(":")[1])
         product = await get_product(pid)
@@ -650,7 +853,8 @@ async def sold_product(cb: CallbackQuery):
 
 @dp.message(F.text == "🔍 За назвою")
 async def search_name_start(msg: Message, state: FSMContext):
-    if not await require_auth(msg, state): return
+    role = await require_auth(msg, state, need_full=True)
+    if not role: return
     await state.set_state(SearchName.typing)
     await msg.answer("🔍 Введіть *назву товару* (або її частину):", reply_markup=kb_cancel())
 
@@ -671,7 +875,8 @@ async def search_name_do(msg: Message, state: FSMContext):
 
 @dp.message(F.text == "📤 CSV товарів")
 async def export_products_csv(msg: Message, state: FSMContext):
-    if not await require_auth(msg, state): return
+    role = await require_auth(msg, state, need_full=True)
+    if not role: return
     try:
         products = await get_all_products()
         if not products:
@@ -693,13 +898,15 @@ async def export_products_csv(msg: Message, state: FSMContext):
 
 @dp.message(F.text == "🧮 Калькулятор")
 async def calc_menu(msg: Message, state: FSMContext):
-    if not await require_auth(msg, state): return
+    role = await require_auth(msg, state)
+    if not role: return
     await state.clear()
-    await msg.answer("🧮 *Калькулятор*\n\nОбери дію:", reply_markup=kb_calc_menu())
+    await msg.answer("🧮 *Калькулятор*\n\nОбери дію:", reply_markup=kb_calc_menu(role))
 
 @dp.message(F.text == "⚙️ Налаштування калькулятора")
 async def calc_settings_menu(msg: Message, state: FSMContext):
-    if not await require_auth(msg, state): return
+    role = await require_auth(msg, state)
+    if not role: return
     s = await get_calc_settings()
     text = (
         "⚙️ *Налаштування калькулятора*\n\n"
@@ -731,8 +938,9 @@ async def calcset_choose(cb: CallbackQuery, state: FSMContext):
 
 @dp.message(CalcSettingsEdit.typing)
 async def calcset_save(msg: Message, state: FSMContext):
+    role = cached_role(msg.from_user.id)
     if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu(role))
     fd = await state.get_data()
     field = fd["calcset_field"]
     value = parse_float(msg.text)
@@ -748,17 +956,18 @@ async def calcset_save(msg: Message, state: FSMContext):
         f"💱 Курс юаня: *{s['yuan_rate']:.2f} грн*\n"
         f"💵 Курс долара: *{s['usd_rate']:.2f} грн*"
     )
-    await msg.answer(text, reply_markup=kb_calc_menu())
+    await msg.answer(text, reply_markup=kb_calc_menu(role))
 
 @dp.message(F.text == "➕ Порахувати товар")
 async def calc_start(msg: Message, state: FSMContext):
-    if not await require_auth(msg, state): return
+    role = await require_auth(msg, state)
+    if not role: return
     s = await get_calc_settings()
     if not all(s.values()):
         return await msg.answer(
             "⚠️ Спочатку задайте ціни доставки (авіа і морем, у $), курс юаня і курс долара "
             "в *⚙️ Налаштування калькулятора*.",
-            reply_markup=kb_calc_menu(),
+            reply_markup=kb_calc_menu(role),
         )
     await state.set_state(CalcProduct.photo)
     await msg.answer("📷 Надішліть *фото товару* (або пропустіть):", reply_markup=kb_skip_cancel())
@@ -772,8 +981,9 @@ async def calc_photo(msg: Message, state: FSMContext):
 
 @dp.message(CalcProduct.photo)
 async def calc_photo_text(msg: Message, state: FSMContext):
+    role = cached_role(msg.from_user.id)
     if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu(role))
     if msg.text == "⏩ Пропустити":
         await state.update_data(calc_photo_id="")
         await state.set_state(CalcProduct.name)
@@ -782,24 +992,27 @@ async def calc_photo_text(msg: Message, state: FSMContext):
 
 @dp.message(CalcProduct.name)
 async def calc_name(msg: Message, state: FSMContext):
+    role = cached_role(msg.from_user.id)
     if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu(role))
     await state.update_data(calc_name=msg.text.strip())
     await state.set_state(CalcProduct.description)
     await msg.answer("📝 Введіть *опис товару* (можна пропустити):", reply_markup=kb_skip_cancel())
 
 @dp.message(CalcProduct.description)
 async def calc_description(msg: Message, state: FSMContext):
+    role = cached_role(msg.from_user.id)
     if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu(role))
     await state.update_data(calc_description="" if msg.text == "⏩ Пропустити" else msg.text.strip())
     await state.set_state(CalcProduct.link)
     await msg.answer("🔗 Введіть *посилання на товар* (можна пропустити):", reply_markup=kb_skip_cancel())
 
 @dp.message(CalcProduct.link)
 async def calc_link(msg: Message, state: FSMContext):
+    role = cached_role(msg.from_user.id)
     if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu(role))
     if msg.text == "⏩ Пропустити":
         await state.update_data(calc_link="")
     else:
@@ -815,8 +1028,9 @@ async def calc_link(msg: Message, state: FSMContext):
 
 @dp.message(CalcProduct.rating)
 async def calc_rating(msg: Message, state: FSMContext):
+    role = cached_role(msg.from_user.id)
     if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu(role))
     if msg.text == "⏩ Пропустити":
         await state.update_data(calc_rating="0")
     else:
@@ -832,8 +1046,9 @@ async def calc_rating(msg: Message, state: FSMContext):
 
 @dp.message(CalcProduct.price_yuan)
 async def calc_price(msg: Message, state: FSMContext):
+    role = cached_role(msg.from_user.id)
     if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu(role))
     value = parse_float(msg.text)
     if value <= 0:
         return await msg.answer("⚠️ Введіть додатнє число, наприклад *25.5*:", reply_markup=kb_cancel())
@@ -843,8 +1058,9 @@ async def calc_price(msg: Message, state: FSMContext):
 
 @dp.message(CalcProduct.weight)
 async def calc_weight(msg: Message, state: FSMContext):
+    role = cached_role(msg.from_user.id)
     if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu(role))
     weight = parse_float(msg.text)
     if weight <= 0:
         return await msg.answer("⚠️ Введіть додатнє число, наприклад *0.5*:", reply_markup=kb_cancel())
@@ -854,8 +1070,9 @@ async def calc_weight(msg: Message, state: FSMContext):
 
 @dp.message(CalcProduct.delivery_method)
 async def calc_delivery_method(msg: Message, state: FSMContext):
+    role = cached_role(msg.from_user.id)
     if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu(role))
     if msg.text not in ("✈️ Авіа", "🚢 Море"):
         return await msg.answer("Будь ласка, оберіть спосіб доставки кнопкою нижче:", reply_markup=kb_delivery_method())
 
@@ -902,15 +1119,16 @@ async def calc_delivery_method(msg: Message, state: FSMContext):
         await msg.answer_photo(photo=photo_id, caption=fmt_calc(record), reply_markup=ikb_calc_actions(record["id"], record))
     else:
         await msg.answer(fmt_calc(record), reply_markup=ikb_calc_actions(record["id"], record))
-    await msg.answer("Готово ✅ Розрахунок збережено.", reply_markup=kb_calc_menu())
+    await msg.answer("Готово ✅ Розрахунок збережено.", reply_markup=kb_calc_menu(role))
 
 @dp.message(F.text == "📄 Мої розрахунки")
 async def list_calcs(msg: Message, state: FSMContext):
-    if not await require_auth(msg, state): return
+    role = await require_auth(msg, state)
+    if not role: return
     calcs = await get_all_calcs()
     if not calcs:
-        return await msg.answer("📭 Розрахунків ще немає.", reply_markup=kb_calc_menu())
-    await msg.answer(f"📄 *Розрахунки* — {len(calcs)} шт.", reply_markup=kb_calc_menu())
+        return await msg.answer("📭 Розрахунків ще немає.", reply_markup=kb_calc_menu(role))
+    await msg.answer(f"📄 *Розрахунки* — {len(calcs)} шт.", reply_markup=kb_calc_menu(role))
     for c in calcs:
         if c.get("photo_id"):
             await msg.answer_photo(photo=c["photo_id"], caption=fmt_calc(c), reply_markup=ikb_calc_actions(c["id"], c))
@@ -962,8 +1180,9 @@ async def editcalcfield_choose(cb: CallbackQuery, state: FSMContext):
 
 @dp.message(CalcEditField.typing)
 async def editcalcfield_save(msg: Message, state: FSMContext):
+    role = cached_role(msg.from_user.id)
     if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu(role))
     fd = await state.get_data()
     cid, field = fd["edit_cid"], fd["edit_field"]
     value = msg.text.strip()
@@ -1002,14 +1221,15 @@ async def editcalcfield_save(msg: Message, state: FSMContext):
             await msg.answer_photo(photo=record["photo_id"], caption=f"✅ Оновлено!\n\n{fmt_calc(record)}", reply_markup=ikb_calc_actions(cid, record))
         else:
             await msg.answer(f"✅ Оновлено!\n\n{fmt_calc(record)}", reply_markup=ikb_calc_actions(cid, record))
-        await msg.answer("Готово ✅", reply_markup=kb_calc_menu())
+        await msg.answer("Готово ✅", reply_markup=kb_calc_menu(role))
     else:
-        await msg.answer("Розрахунок не знайдено.", reply_markup=kb_calc_menu())
+        await msg.answer("Розрахунок не знайдено.", reply_markup=kb_calc_menu(role))
 
 @dp.message(CalcEditField.typing_delivery)
 async def editcalcfield_delivery_save(msg: Message, state: FSMContext):
+    role = cached_role(msg.from_user.id)
     if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu(role))
     if msg.text not in ("✈️ Авіа", "🚢 Море"):
         return await msg.answer("Оберіть спосіб доставки кнопкою нижче:", reply_markup=kb_delivery_method())
     method = "avia" if msg.text == "✈️ Авіа" else "sea"
@@ -1024,9 +1244,9 @@ async def editcalcfield_delivery_save(msg: Message, state: FSMContext):
             await msg.answer_photo(photo=record["photo_id"], caption=f"✅ Оновлено!\n\n{fmt_calc(record)}", reply_markup=ikb_calc_actions(cid, record))
         else:
             await msg.answer(f"✅ Оновлено!\n\n{fmt_calc(record)}", reply_markup=ikb_calc_actions(cid, record))
-        await msg.answer("Готово ✅", reply_markup=kb_calc_menu())
+        await msg.answer("Готово ✅", reply_markup=kb_calc_menu(role))
     else:
-        await msg.answer("Розрахунок не знайдено.", reply_markup=kb_calc_menu())
+        await msg.answer("Розрахунок не знайдено.", reply_markup=kb_calc_menu(role))
 
 @dp.callback_query(F.data.startswith("delcalc:"))
 async def delete_calc_cb(cb: CallbackQuery):
@@ -1046,11 +1266,11 @@ async def delete_calc_cb(cb: CallbackQuery):
         except TelegramAPIError:
             pass
 
-async def _proceed_to_choosing(target, state: FSMContext, filtered: list, uid: int):
+async def _proceed_to_choosing(target, state: FSMContext, filtered: list, uid: int, role: str):
     if not filtered:
         await state.clear()
         send_calc_cache.pop(uid, None)
-        return await target.answer("📭 Немає розрахунків за цим критерієм.", reply_markup=kb_calc_menu())
+        return await target.answer("📭 Немає розрахунків за цим критерієм.", reply_markup=kb_calc_menu(role))
     send_calc_cache[uid] = filtered
     await state.set_state(SendCalc.choosing)
     await state.update_data(send_selected=[])
@@ -1062,18 +1282,20 @@ async def _proceed_to_choosing(target, state: FSMContext, filtered: list, uid: i
 
 @dp.message(F.text == "📤 Переслати/Зберегти")
 async def send_calc_start(msg: Message, state: FSMContext):
-    if not await require_auth(msg, state): return
+    role = await require_auth(msg, state)
+    if not role: return
     calcs = await get_all_calcs()
     if not calcs:
-        return await msg.answer("📭 Розрахунків ще немає.", reply_markup=kb_calc_menu())
+        return await msg.answer("📭 Розрахунків ще немає.", reply_markup=kb_calc_menu(role))
     await state.set_state(SendCalc.filter_choice)
     await msg.answer("📤 Оберіть критерій фільтра розрахунків нижче.", reply_markup=kb_cancel())
     await msg.answer("Критерій:", reply_markup=ikb_send_calc_filter())
 
 @dp.message(SendCalc.filter_choice)
 async def send_calc_filter_text(msg: Message, state: FSMContext):
+    role = cached_role(msg.from_user.id)
     if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu(role))
     await msg.answer("Оберіть критерій кнопками вище, або натисніть ❌ Скасувати.", reply_markup=kb_cancel())
 
 @dp.callback_query(F.data.startswith("filtercalc:"), SendCalc.filter_choice)
@@ -1081,15 +1303,16 @@ async def filtercalc_choose(cb: CallbackQuery, state: FSMContext):
     try:
         criterion = cb.data.split(":", 1)[1]
         uid = cb.from_user.id
+        role = cached_role(uid)
         calcs = await get_all_calcs()
         if criterion == "all":
-            await _proceed_to_choosing(cb.message, state, calcs, uid)
+            await _proceed_to_choosing(cb.message, state, calcs, uid, role)
         elif criterion == "rating":
             await state.set_state(SendCalc.filter_rating)
             await cb.message.answer("⭐ Введіть мінімальний рейтинг (0-10):", reply_markup=kb_cancel())
         elif criterion in ("avia", "sea"):
             filtered = [c for c in calcs if c.get("delivery_method") == criterion]
-            await _proceed_to_choosing(cb.message, state, filtered, uid)
+            await _proceed_to_choosing(cb.message, state, filtered, uid, role)
         await cb.answer()
     except Exception:
         logger.exception("filtercalc_choose failed")
@@ -1100,8 +1323,9 @@ async def filtercalc_choose(cb: CallbackQuery, state: FSMContext):
 
 @dp.message(SendCalc.filter_rating)
 async def filter_rating_do(msg: Message, state: FSMContext):
+    role = cached_role(msg.from_user.id)
     if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu(role))
     try:
         threshold = int(msg.text.strip())
     except ValueError:
@@ -1110,7 +1334,7 @@ async def filter_rating_do(msg: Message, state: FSMContext):
         return await msg.answer("⚠️ Рейтинг має бути від 0 до 10:", reply_markup=kb_cancel())
     calcs = await get_all_calcs()
     filtered = [c for c in calcs if parse_int(c.get("rating", 0)) >= threshold]
-    await _proceed_to_choosing(msg, state, filtered, msg.from_user.id)
+    await _proceed_to_choosing(msg, state, filtered, msg.from_user.id, role)
 
 @dp.callback_query(F.data.startswith("selcalc:"), SendCalc.choosing)
 async def toggle_selcalc(cb: CallbackQuery, state: FSMContext):
@@ -1155,13 +1379,14 @@ async def select_all_calc(cb: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "selcalc_cancel", SendCalc.choosing)
 async def selcalc_cancel(cb: CallbackQuery, state: FSMContext):
     try:
+        role = cached_role(cb.from_user.id)
         await state.clear()
         send_calc_cache.pop(cb.from_user.id, None)
         try:
             await cb.message.delete()
         except TelegramAPIError:
             pass
-        await cb.message.answer("Скасовано.", reply_markup=kb_calc_menu())
+        await cb.message.answer("Скасовано.", reply_markup=kb_calc_menu(role))
         await cb.answer()
     except Exception:
         logger.exception("selcalc_cancel failed")
@@ -1189,10 +1414,11 @@ async def selcalc_done(cb: CallbackQuery, state: FSMContext):
 
 @dp.message(SendCalc.action_choice)
 async def send_calc_action_text(msg: Message, state: FSMContext):
+    role = cached_role(msg.from_user.id)
     if msg.text == "❌ Скасувати":
         await state.clear()
         send_calc_cache.pop(msg.from_user.id, None)
-        return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+        return await msg.answer("Скасовано.", reply_markup=kb_calc_menu(role))
     await msg.answer("Оберіть дію кнопками вище, або натисніть ❌ Скасувати.", reply_markup=kb_cancel())
 
 @dp.callback_query(F.data == "calcaction:send", SendCalc.action_choice)
@@ -1217,18 +1443,19 @@ async def calcaction_save(cb: CallbackQuery, state: FSMContext):
     try:
         fd = await state.get_data()
         selected_ids = set(fd.get("send_selected", []))
+        role = cached_role(cb.from_user.id)
         await state.clear()
         uid = cb.from_user.id
         send_calc_cache.pop(uid, None)
         all_calcs = await get_all_calcs()
         to_save = [c for c in all_calcs if c["id"] in selected_ids]
         if not to_save:
-            return await cb.message.answer("⚠️ Обрані розрахунки не знайдено.", reply_markup=kb_calc_menu())
+            return await cb.message.answer("⚠️ Обрані розрахунки не знайдено.", reply_markup=kb_calc_menu(role))
         csv_bytes = build_calc_csv(to_save)
         filename = f"calcs_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
         file = BufferedInputFile(csv_bytes, filename=filename)
         await cb.message.answer_document(document=file, caption=f"💾 Збережено — {len(to_save)} шт.")
-        await cb.message.answer("Готово ✅", reply_markup=kb_calc_menu())
+        await cb.message.answer("Готово ✅", reply_markup=kb_calc_menu(role))
         await cb.answer()
     except Exception:
         logger.exception("calcaction_save failed")
@@ -1240,9 +1467,10 @@ async def calcaction_save(cb: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "calcaction:cancel", SendCalc.action_choice)
 async def calcaction_cancel(cb: CallbackQuery, state: FSMContext):
     try:
+        role = cached_role(cb.from_user.id)
         await state.clear()
         send_calc_cache.pop(cb.from_user.id, None)
-        await cb.message.answer("Скасовано.", reply_markup=kb_calc_menu())
+        await cb.message.answer("Скасовано.", reply_markup=kb_calc_menu(role))
         await cb.answer()
     except Exception:
         logger.exception("calcaction_cancel failed")
@@ -1254,10 +1482,11 @@ async def calcaction_cancel(cb: CallbackQuery, state: FSMContext):
 @dp.message(SendCalc.waiting_username)
 async def send_calc_do(msg: Message, state: FSMContext):
     uid = msg.from_user.id
+    role = cached_role(uid)
     if msg.text == "❌ Скасувати":
         await state.clear()
         send_calc_cache.pop(uid, None)
-        return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+        return await msg.answer("Скасовано.", reply_markup=kb_calc_menu(role))
 
     username = msg.text.strip()
     fd = await state.get_data()
@@ -1270,13 +1499,13 @@ async def send_calc_do(msg: Message, state: FSMContext):
         return await msg.answer(
             f"⚠️ Користувача {username} не знайдено.\n"
             "Отримувач має спершу написати боту /start (тоді бот зможе йому щось надіслати).",
-            reply_markup=kb_calc_menu(),
+            reply_markup=kb_calc_menu(role),
         )
 
     all_calcs = await get_all_calcs()
     to_send = [c for c in all_calcs if c["id"] in selected_ids]
     if not to_send:
-        return await msg.answer("⚠️ Обрані розрахунки не знайдено (можливо, вже видалені).", reply_markup=kb_calc_menu())
+        return await msg.answer("⚠️ Обрані розрахунки не знайдено (можливо, вже видалені).", reply_markup=kb_calc_menu(role))
 
     sent = 0
     for c in to_send:
@@ -1289,14 +1518,284 @@ async def send_calc_do(msg: Message, state: FSMContext):
         except TelegramAPIError:
             logger.exception("Не вдалось надіслати розрахунок №%s", c.get("id"))
 
-    await msg.answer(f"📤 Надіслано {sent}/{len(to_send)} розрахунків користувачу {username}.", reply_markup=kb_calc_menu())
+    await msg.answer(f"📤 Надіслано {sent}/{len(to_send)} розрахунків користувачу {username}.", reply_markup=kb_calc_menu(role))
+
+# ---------------------------------------------------------------------------
+# Кошики (бюджети) — хендлери
+# ---------------------------------------------------------------------------
+
+@dp.message(F.text == "🧺 Кошики")
+async def list_baskets(msg: Message, state: FSMContext):
+    role = await require_auth(msg, state)
+    if not role: return
+    await state.clear()
+    try:
+        baskets = await get_all_baskets()
+        all_ids = []
+        for b in baskets:
+            all_ids.extend(b.get("calc_ids", []))
+        calcs_by_id = await calcs_map_by_id(all_ids)
+        text = f"🧺 *Кошики* — {len(baskets)} шт." if baskets else "📭 Кошиків ще немає."
+        await msg.answer(text, reply_markup=kb_calc_menu(role))
+        await msg.answer("Обери кошик або створи новий:", reply_markup=ikb_baskets_list(baskets, calcs_by_id))
+    except Exception:
+        logger.exception("list_baskets failed")
+        await msg.answer(DB_ERROR_TEXT, reply_markup=kb_calc_menu(role))
+
+@dp.callback_query(F.data == "basket_new")
+async def basket_new_start(cb: CallbackQuery, state: FSMContext):
+    try:
+        await state.set_state(BasketCreate.name)
+        await cb.message.answer("📝 Введіть *назву кошика* (наприклад «Замовлення для клієнта»):", reply_markup=kb_cancel())
+        await cb.answer()
+    except Exception:
+        logger.exception("basket_new_start failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.message(BasketCreate.name)
+async def basket_new_name(msg: Message, state: FSMContext):
+    role = cached_role(msg.from_user.id)
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu(role))
+    await state.update_data(basket_name=msg.text.strip())
+    await state.set_state(BasketCreate.budget)
+    await msg.answer("💰 Введіть *бюджет* кошика (грн):", reply_markup=kb_cancel())
+
+@dp.message(BasketCreate.budget)
+async def basket_new_budget(msg: Message, state: FSMContext):
+    role = cached_role(msg.from_user.id)
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu(role))
+    budget = parse_float(msg.text)
+    if budget <= 0:
+        return await msg.answer("⚠️ Введіть додатнє число, наприклад *5000*:", reply_markup=kb_cancel())
+    fd = await state.get_data()
+    await state.clear()
+    basket = {
+        "id":         await next_basket_id(),
+        "name":       fd.get("basket_name", ""),
+        "budget":     budget,
+        "calc_ids":   [],
+        "created_at": datetime.now().isoformat(),
+        "created_by": msg.from_user.id,
+    }
+    await add_basket(basket)
+    await msg.answer(f"✅ *Кошик створено!*\n\n{fmt_basket(basket, {})}", reply_markup=ikb_basket_actions(basket["id"]))
+    await msg.answer("Готово ✅", reply_markup=kb_calc_menu(role))
+
+@dp.callback_query(F.data.startswith("basket_view:"))
+async def basket_view_cb(cb: CallbackQuery):
+    try:
+        bid = int(cb.data.split(":")[1])
+        b = await get_basket(bid)
+        if not b:
+            return await cb.answer("Кошик не знайдено!", show_alert=True)
+        calcs_by_id = await calcs_map_by_id(b.get("calc_ids", []))
+        text = fmt_basket(b, calcs_by_id)
+        try:
+            await cb.message.edit_text(text, reply_markup=ikb_basket_actions(bid))
+        except TelegramAPIError:
+            await cb.message.answer(text, reply_markup=ikb_basket_actions(bid))
+        await cb.answer()
+    except Exception:
+        logger.exception("basket_view_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data == "basket_back")
+async def basket_back_cb(cb: CallbackQuery):
+    try:
+        baskets = await get_all_baskets()
+        all_ids = []
+        for b in baskets:
+            all_ids.extend(b.get("calc_ids", []))
+        calcs_by_id = await calcs_map_by_id(all_ids)
+        text = f"🧺 *Кошики* — {len(baskets)} шт." if baskets else "📭 Кошиків ще немає."
+        try:
+            await cb.message.edit_text(text, reply_markup=ikb_baskets_list(baskets, calcs_by_id))
+        except TelegramAPIError:
+            await cb.message.answer(text, reply_markup=ikb_baskets_list(baskets, calcs_by_id))
+        await cb.answer()
+    except Exception:
+        logger.exception("basket_back_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data.startswith("basket_del:"))
+async def basket_del_cb(cb: CallbackQuery):
+    try:
+        bid = int(cb.data.split(":")[1])
+        await delete_basket(bid)
+        text = f"🗑 Кошик №{bid} видалено."
+        try:
+            await cb.message.edit_text(text)
+        except TelegramAPIError:
+            await cb.message.answer(text)
+        await cb.answer("Видалено!")
+    except Exception:
+        logger.exception("basket_del_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data.startswith("basket_add:"))
+async def basket_add_cb(cb: CallbackQuery):
+    try:
+        _, bid_s, page_s = cb.data.split(":")
+        bid, page = int(bid_s), int(page_s)
+        b = await get_basket(bid)
+        if not b:
+            return await cb.answer("Кошик не знайдено!", show_alert=True)
+        calcs = await get_all_calcs()
+        if not calcs:
+            return await cb.answer("Немає жодного розрахунку. Спочатку створіть товар у калькуляторі.", show_alert=True)
+        in_basket = set(b.get("calc_ids", []))
+        text = f"➕ *Додавання товарів у кошик №{bid}*\nОберіть товар зі списку:"
+        try:
+            await cb.message.edit_text(text, reply_markup=ikb_basket_add_list(bid, calcs, in_basket, page))
+        except TelegramAPIError:
+            await cb.message.answer(text, reply_markup=ikb_basket_add_list(bid, calcs, in_basket, page))
+        await cb.answer()
+    except Exception:
+        logger.exception("basket_add_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data.startswith("basket_addsel:"))
+async def basket_addsel_cb(cb: CallbackQuery):
+    try:
+        _, bid_s, cid_s, page_s = cb.data.split(":")
+        bid, cid, page = int(bid_s), int(cid_s), int(page_s)
+        b = await get_basket(bid)
+        if not b:
+            return await cb.answer("Кошик не знайдено!", show_alert=True)
+        await basket_add_calc(bid, cid)
+        b = await get_basket(bid)
+        calcs = await get_all_calcs()
+        in_basket = set(b.get("calc_ids", []))
+        try:
+            await cb.message.edit_reply_markup(reply_markup=ikb_basket_add_list(bid, calcs, in_basket, page))
+        except TelegramAPIError:
+            pass
+        calcs_in = {c["id"]: c for c in calcs if c["id"] in in_basket}
+        total = sum(parse_float(c.get("cost_price_uah", 0)) for c in calcs_in.values())
+        budget = parse_float(b.get("budget", 0))
+        remaining = budget - total
+        note = "✅" if remaining >= 0 else "⚠️ бюджет перевищено"
+        await cb.answer(f"Додано! Витрачено {total:,.0f}/{budget:,.0f} грн {note}")
+    except Exception:
+        logger.exception("basket_addsel_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data.startswith("basket_rmlist:"))
+async def basket_rmlist_cb(cb: CallbackQuery):
+    try:
+        bid = int(cb.data.split(":")[1])
+        b = await get_basket(bid)
+        if not b:
+            return await cb.answer("Кошик не знайдено!", show_alert=True)
+        if not b.get("calc_ids"):
+            return await cb.answer("У кошику ще немає товарів.", show_alert=True)
+        calcs_by_id = await calcs_map_by_id(b.get("calc_ids", []))
+        text = f"➖ *Видалення товарів з кошика №{bid}*\nОберіть товар:"
+        try:
+            await cb.message.edit_text(text, reply_markup=ikb_basket_remove_list(bid, calcs_by_id))
+        except TelegramAPIError:
+            await cb.message.answer(text, reply_markup=ikb_basket_remove_list(bid, calcs_by_id))
+        await cb.answer()
+    except Exception:
+        logger.exception("basket_rmlist_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data.startswith("basket_rm:"))
+async def basket_rm_cb(cb: CallbackQuery):
+    try:
+        _, bid_s, cid_s = cb.data.split(":")
+        bid, cid = int(bid_s), int(cid_s)
+        await basket_remove_calc(bid, cid)
+        b = await get_basket(bid)
+        if not b:
+            return await cb.answer("Кошик не знайдено!", show_alert=True)
+        calcs_by_id = await calcs_map_by_id(b.get("calc_ids", []))
+        try:
+            await cb.message.edit_reply_markup(reply_markup=ikb_basket_remove_list(bid, calcs_by_id))
+        except TelegramAPIError:
+            pass
+        await cb.answer("Прибрано!")
+    except Exception:
+        logger.exception("basket_rm_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data.startswith("tobasket:"))
+async def tobasket_cb(cb: CallbackQuery):
+    try:
+        cid = int(cb.data.split(":")[1])
+        baskets = await get_all_baskets()
+        if not baskets:
+            await cb.message.answer("📭 Кошиків ще немає. Створіть новий:", reply_markup=ikb_pick_basket(cid, []))
+            return await cb.answer()
+        await cb.message.answer(f"Оберіть кошик для товару №{cid}:", reply_markup=ikb_pick_basket(cid, baskets))
+        await cb.answer()
+    except Exception:
+        logger.exception("tobasket_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data.startswith("tobasketsel:"))
+async def tobasketsel_cb(cb: CallbackQuery):
+    try:
+        _, cid_s, bid_s = cb.data.split(":")
+        cid, bid = int(cid_s), int(bid_s)
+        b = await get_basket(bid)
+        if not b:
+            return await cb.answer("Кошик не знайдено!", show_alert=True)
+        await basket_add_calc(bid, cid)
+        b = await get_basket(bid)
+        calcs_by_id = await calcs_map_by_id(b.get("calc_ids", []))
+        total = sum(parse_float(c.get("cost_price_uah", 0)) for c in calcs_by_id.values())
+        budget = parse_float(b.get("budget", 0))
+        remaining = budget - total
+        note = "✅" if remaining >= 0 else "⚠️ бюджет перевищено"
+        await cb.message.answer(f"✅ Додано у кошик №{bid}.\nВитрачено {total:,.0f}/{budget:,.0f} грн {note}")
+        await cb.answer("Додано!")
+    except Exception:
+        logger.exception("tobasketsel_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
 
 @dp.message()
 async def fallback_message_handler(msg: Message, state: FSMContext):
-    if not await require_auth(msg, state):
+    role = await require_auth(msg, state)
+    if not role:
         return
     await state.clear()
-    await msg.answer("🤔 Не розпізнав цю дію. Повертаю в головне меню.", reply_markup=kb_main())
+    if role == "full":
+        await msg.answer("🤔 Не розпізнав цю дію. Повертаю в головне меню.", reply_markup=kb_main())
+    else:
+        await msg.answer("🤔 Не розпізнав цю дію. Повертаю в меню калькулятора.", reply_markup=kb_calc_menu(role))
 
 @dp.callback_query()
 async def fallback_callback_handler(cb: CallbackQuery, state: FSMContext):
@@ -1322,7 +1821,7 @@ async def main():
     except Exception:
         logger.exception("MongoDB connection FAILED at startup")
 
-    await load_authorized_uids()
+    await load_user_roles()
 
     app = web.Application()
     app.router.add_get("/", health)
