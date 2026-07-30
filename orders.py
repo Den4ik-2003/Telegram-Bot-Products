@@ -67,13 +67,6 @@ async def db_call(coro, default=None):
         logger.exception("MongoDB error")
         return default
 
-# ---------------------------------------------------------------------------
-# Auth. Кешуємо авторизованих юзерів у пам'яті процесу, щоб уникнути ситуації,
-# коли одразу після успішного логіну наступний read з MongoDB (наприклад, з
-# secondary-репліки, яка ще не встигла реплікувати запис) не знаходить щойно
-# створений документ і бот знову просить пароль. Кеш заповнюється при старті
-# і оновлюється відразу після кожної успішної авторизації.
-# ---------------------------------------------------------------------------
 authorized_uids: set[int] = set()
 
 async def load_authorized_uids():
@@ -107,12 +100,6 @@ async def authorize(uid: int) -> bool:
         logger.exception("MongoDB error in authorize")
         return False
 
-# ---------------------------------------------------------------------------
-# Users. Зберігаємо мапінг username -> uid для всіх, хто хоч раз натиснув
-# /start, щоб мати змогу надсилати їм повідомлення від імені бота за
-# username (Telegram Bot API не дозволяє відправляти повідомлення в приватний
-# чат просто за username - потрібен chat_id, який ми і зберігаємо тут).
-# ---------------------------------------------------------------------------
 async def upsert_user(uid: int, username: str | None, first_name: str = ""):
     username_norm = (username or "").lower().lstrip("@")
     await db_call(users_col.update_one(
@@ -133,13 +120,6 @@ async def get_uid_by_username(username: str):
     doc = await db_call(users_col.find_one({"username": username_norm}))
     return doc["uid"] if doc else None
 
-async def get_categories() -> list:
-    doc = await db_call(settings_col.find_one({"_id": "categories"}))
-    return doc["values"] if doc else []
-
-async def save_categories(categories: list):
-    await db_call(settings_col.update_one({"_id": "categories"}, {"$set": {"values": categories}}, upsert=True))
-
 async def next_product_id() -> int:
     doc = await db_call(products_col.find_one(sort=[("id", -1)]))
     return (doc["id"] + 1) if doc else 1
@@ -150,9 +130,6 @@ async def add_product(product: dict):
 async def get_product(pid: int) -> dict | None:
     return await db_call(products_col.find_one({"id": pid}, {"_id": 0}))
 
-async def update_product(pid: int, fields: dict):
-    await db_call(products_col.update_one({"id": pid}, {"$set": fields}))
-
 async def delete_product(pid: int):
     await db_call(products_col.delete_one({"id": pid}))
 
@@ -160,9 +137,6 @@ async def get_all_products() -> list:
     cursor = products_col.find({}, {"_id": 0}).sort("id", -1)
     return await db_call(cursor.to_list(length=None), default=[]) or []
 
-# ---------------------------------------------------------------------------
-# Калькулятор: налаштування (ціна доставки за 1 кг авіа/морем у $, курс юаня, курс долара)
-# ---------------------------------------------------------------------------
 async def get_calc_settings() -> dict:
     doc = await db_call(settings_col.find_one({"_id": "calc_settings"}))
     defaults = {
@@ -194,8 +168,35 @@ async def get_all_calcs() -> list:
 async def get_calc(cid: int) -> dict | None:
     return await db_call(calc_col.find_one({"id": cid}, {"_id": 0}))
 
+async def update_calc(cid: int, fields: dict):
+    await db_call(calc_col.update_one({"id": cid}, {"$set": fields}))
+
 async def delete_calc(cid: int):
     await db_call(calc_col.delete_one({"id": cid}))
+
+async def recalc_calc_costs(cid: int):
+    record = await get_calc(cid)
+    if not record:
+        return None
+    s = await get_calc_settings()
+    method = record.get("delivery_method", "avia")
+    rate_per_kg_usd = s["price_per_kg_avia"] if method == "avia" else s["price_per_kg_sea"]
+    weight = parse_float(record.get("weight_kg", 0))
+    price_yuan = parse_float(record.get("price_yuan", 0))
+    delivery_cost_usd = weight * rate_per_kg_usd
+    delivery_cost_uah = delivery_cost_usd * s["usd_rate"]
+    price_uah = price_yuan * s["yuan_rate"]
+    cost_price_uah = price_uah + delivery_cost_uah
+    cost_price_usd = cost_price_uah / s["usd_rate"] if s["usd_rate"] else 0.0
+    fields = {
+        "price_uah": price_uah,
+        "delivery_cost_usd": delivery_cost_usd,
+        "delivery_cost_uah": delivery_cost_uah,
+        "cost_price_uah": cost_price_uah,
+        "cost_price_usd": cost_price_usd,
+    }
+    await update_calc(cid, fields)
+    return await get_calc(cid)
 
 def parse_float(val) -> float:
     try:
@@ -213,105 +214,69 @@ def is_valid_link(val: str) -> bool:
     val = (val or "").strip().lower()
     return val.startswith("http://") or val.startswith("https://")
 
-# ---------------------------------------------------------------------------
-# Статуси товару
-# ---------------------------------------------------------------------------
-STATUS_META = {
-    "idea":      {"emoji": "🟡", "label": "Ідея"},
-    "analyzing": {"emoji": "🔍", "label": "Аналізую"},
-    "ready":     {"emoji": "✅", "label": "Готовий до закупівлі"},
-    "ordered":   {"emoji": "📦", "label": "Замовлено"},
-    "rejected":  {"emoji": "❌", "label": "Відхилено"},
-}
-STATUS_ORDER = ["idea", "analyzing", "ready", "ordered", "rejected"]
-DEFAULT_STATUS = "idea"
-
 def fmt_stars(rating: int) -> str:
     rating = max(0, min(10, rating))
     return "⭐" * rating + "☆" * (10 - rating) + f" ({rating}/10)"
 
 def fmt_product(p: dict) -> str:
     cost = parse_float(p.get("cost_price", 0))
-    sale = parse_float(p.get("sale_price", 0))
-    margin = sale - cost
-    rating = max(0, min(10, parse_int(p.get("rating", 0))))
-    status_key = p.get("status") or DEFAULT_STATUS
-    status_meta = STATUS_META.get(status_key, STATUS_META[DEFAULT_STATUS])
-    lines = [
-        f"*№{p['id']} — {p.get('name','')}*",
-        f"📌 Статус: {status_meta['emoji']} {status_meta['label']}",
-        f"🔖 Артикул: `{p.get('sku','—')}`",
-        f"🏷 Категорія: *{p.get('category','—')}*",
-    ]
-    if p.get("size"):
-        lines.append(f"📏 Розмір: *{p['size']}*")
-    if p.get("color"):
-        lines.append(f"🎨 Колір: *{p['color']}*")
-    if p.get("description"):
-        lines.append(f"📝 {p['description']}")
-    lines += [
-        f"⭐ Оцінка: {fmt_stars(rating)}",
-        f"💵 Собівартість: *{cost:,.0f} грн*",
-        f"💰 Ціна продажу: *{sale:,.0f} грн*",
-        f"📈 Маржа: *{margin:,.0f} грн*",
-        f"📦 На складі: *{parse_int(p.get('stock_qty',0))} шт*",
-    ]
-    if p.get("link"):
-        lines.append("🔗 Посилання на товар додано (кнопка нижче)")
-    return "\n".join(lines)
+    return (
+        f"*№{p['id']} — {p.get('name','')}*\n"
+        f"💵 Собівартість: *{cost:,.0f} грн*"
+    )
 
 DELIVERY_METHOD_LABELS = {"avia": "✈️ Авіа", "sea": "🚢 Море"}
 
 def fmt_calc(c: dict) -> str:
+    rating = max(0, min(10, parse_int(c.get("rating", 0))))
     method_label = DELIVERY_METHOD_LABELS.get(c.get("delivery_method", ""), "—")
     delivery_usd = c.get("delivery_cost_usd")
     delivery_usd_part = f" ({delivery_usd:,.2f} $)" if delivery_usd is not None else ""
     price_uah = c.get("price_uah")
     price_uah_part = f" (*{price_uah:,.0f} грн*)" if price_uah is not None else ""
-    return (
-        f"*№{c.get('id')} — {c.get('name','')}*\n\n"
-        f"💴 Ціна товару: *{c.get('price_yuan',0):,.2f} ¥*{price_uah_part}\n"
-        f"⚖️ Вага: *{c.get('weight_kg',0):,.2f} кг*\n"
-        f"🚚 Доставка ({method_label}): *{c.get('delivery_cost_uah',0):,.0f} грн*{delivery_usd_part}\n"
+    lines = [f"*№{c.get('id')} — {c.get('name','')}*"]
+    if c.get("description"):
+        lines.append(f"📝 {c['description']}")
+    lines.append(f"⭐ Оцінка: {fmt_stars(rating)}")
+    lines += [
+        f"💴 Ціна товару: *{c.get('price_yuan',0):,.2f} ¥*{price_uah_part}",
+        f"⚖️ Вага: *{c.get('weight_kg',0):,.2f} кг*",
+        f"🚚 Доставка ({method_label}): *{c.get('delivery_cost_uah',0):,.0f} грн*{delivery_usd_part}",
         f"💰 Собівартість: *{c.get('cost_price_uah',0):,.0f} грн* "
-        f"(*{c.get('cost_price_usd',0):,.2f} $*)"
-    )
+        f"(*{c.get('cost_price_usd',0):,.2f} $*)",
+    ]
+    if c.get("link"):
+        lines.append("🔗 Посилання на товар додано (кнопка нижче)")
+    return "\n".join(lines)
+
+def build_calc_csv(calcs: list) -> bytes:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "id", "name", "description", "link", "rating", "price_yuan", "price_uah",
+        "weight_kg", "delivery_method", "delivery_cost_usd", "delivery_cost_uah",
+        "cost_price_uah", "cost_price_usd", "created_at",
+    ])
+    for c in calcs:
+        writer.writerow([
+            c.get("id", ""), c.get("name", ""), c.get("description", ""), c.get("link", ""),
+            c.get("rating", "0"), c.get("price_yuan", ""), c.get("price_uah", ""),
+            c.get("weight_kg", ""), c.get("delivery_method", ""), c.get("delivery_cost_usd", ""),
+            c.get("delivery_cost_uah", ""), c.get("cost_price_uah", ""), c.get("cost_price_usd", ""),
+            c.get("created_at", ""),
+        ])
+    return output.getvalue().encode("utf-8-sig")
 
 class Auth(StatesGroup):
     waiting_password = State()
 
 class AddProduct(StatesGroup):
-    photo         = State()
-    name          = State()
-    description   = State()
-    link          = State()
-    sku           = State()
-    category      = State()
-    category_manual = State()
-    size          = State()
-    color         = State()
-    rating        = State()
-    cost_price    = State()
-    sale_price    = State()
-    stock_qty     = State()
-
-class EditField(StatesGroup):
-    typing = State()
+    photo      = State()
+    name       = State()
+    cost_price = State()
 
 class SearchName(StatesGroup):
     typing = State()
-
-class SearchSku(StatesGroup):
-    typing = State()
-
-class SearchCategory(StatesGroup):
-    typing = State()
-
-class AddCategory(StatesGroup):
-    typing = State()
-
-class DelCategory(StatesGroup):
-    choosing = State()
 
 class CalcSettingsEdit(StatesGroup):
     typing = State()
@@ -319,19 +284,28 @@ class CalcSettingsEdit(StatesGroup):
 class CalcProduct(StatesGroup):
     photo           = State()
     name            = State()
+    description     = State()
+    link            = State()
+    rating          = State()
     price_yuan      = State()
     weight          = State()
     delivery_method = State()
 
+class CalcEditField(StatesGroup):
+    typing          = State()
+    typing_delivery = State()
+
 class SendCalc(StatesGroup):
-    choosing = State()
+    filter_choice  = State()
+    filter_rating  = State()
+    choosing       = State()
+    action_choice  = State()
     waiting_username = State()
 
 def kb_main() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="➕ Новий товар"), KeyboardButton(text="📋 Всі товари")],
-        [KeyboardButton(text="🔍 За назвою"), KeyboardButton(text="🔠 За артикулом")],
-        [KeyboardButton(text="🏷 За категорією"), KeyboardButton(text="⚙️ Категорії")],
+        [KeyboardButton(text="🔍 За назвою")],
         [KeyboardButton(text="🧮 Калькулятор"), KeyboardButton(text="📤 CSV товарів")],
     ], resize_keyboard=True)
 
@@ -349,73 +323,28 @@ def kb_delivery_method() -> ReplyKeyboardMarkup:
         [KeyboardButton(text="❌ Скасувати")],
     ], resize_keyboard=True)
 
-def kb_from_list(items: list, with_manual=False) -> ReplyKeyboardMarkup:
-    rows = [[KeyboardButton(text=item)] for item in items]
-    extra = []
-    if with_manual:
-        extra.append(KeyboardButton(text="✏️ Ввести вручну"))
-    extra.append(KeyboardButton(text="❌ Скасувати"))
-    rows.append(extra)
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
-
 def kb_calc_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="➕ Порахувати товар")],
         [KeyboardButton(text="📄 Мої розрахунки")],
-        [KeyboardButton(text="📤 Переслати розрахунки")],
+        [KeyboardButton(text="📤 Переслати/Зберегти")],
         [KeyboardButton(text="⚙️ Налаштування калькулятора")],
         [KeyboardButton(text="◀️ Головне меню")],
     ], resize_keyboard=True)
 
-def ikb_product_actions(pid: int, product: dict | None = None) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text="✏️ Редагувати", callback_data=f"edit:{pid}")],
-        [InlineKeyboardButton(text="📌 Статус", callback_data=f"status:{pid}")],
-        [InlineKeyboardButton(text="📷 Змінити фото", callback_data=f"editphoto:{pid}")],
-    ]
-    link = (product or {}).get("link", "")
-    if is_valid_link(link):
-        rows.append([InlineKeyboardButton(text="🔗 Посилання на товар", url=link.strip())])
-    rows.append([InlineKeyboardButton(text="✅ Продано", callback_data=f"sold:{pid}")])
-    rows.append([InlineKeyboardButton(text="🗑 Видалити", callback_data=f"delete:{pid}")])
-    rows.append([InlineKeyboardButton(text="◀️ До списку", callback_data="back_to_list")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def ikb_edit_fields(pid: int) -> InlineKeyboardMarkup:
-    fields = [
-        ("name", "Назва"), ("description", "Опис"),
-        ("link", "Посилання"),
-        ("sku", "Артикул"), ("category", "Категорія"),
-        ("size", "Розмір"), ("color", "Колір"),
-        ("rating", "Оцінка (0-10)"),
-        ("cost_price", "Собівартість"), ("sale_price", "Ціна продажу"),
-        ("stock_qty", "Кількість"),
-    ]
-    rows = []
-    for i in range(0, len(fields), 2):
-        row = [InlineKeyboardButton(text=label, callback_data=f"editfield:{pid}:{key}")
-               for key, label in fields[i:i+2]]
-        rows.append(row)
-    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"view:{pid}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-def ikb_status_options(pid: int) -> InlineKeyboardMarkup:
-    rows = []
-    for key in STATUS_ORDER:
-        meta = STATUS_META[key]
-        rows.append([InlineKeyboardButton(
-            text=f"{meta['emoji']} {meta['label']}",
-            callback_data=f"setstatus:{pid}:{key}",
-        )])
-    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data=f"view:{pid}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+def ikb_product_actions(pid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Продано (видалити)", callback_data=f"sold:{pid}")],
+        [InlineKeyboardButton(text="◀️ До списку", callback_data="back_to_list")],
+    ])
 
 def ikb_products_list(products: list, page: int = 0, per_page: int = 8) -> InlineKeyboardMarkup:
     start = page * per_page
     chunk = products[start:start + per_page]
     rows = []
     for p in chunk:
-        label = f"№{p['id']} {p.get('name','')[:20]} — {p.get('sku','')}"
+        cost = parse_float(p.get("cost_price", 0))
+        label = f"№{p['id']} {p.get('name','')[:22]} — {cost:,.0f}грн"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"view:{p['id']}")])
     nav = []
     if page > 0:
@@ -428,12 +357,6 @@ def ikb_products_list(products: list, page: int = 0, per_page: int = 8) -> Inlin
         rows.append(nav)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def ikb_categories_settings() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Додати категорію", callback_data="cfg:add_cat")],
-        [InlineKeyboardButton(text="🗑 Видалити категорію", callback_data="cfg:del_cat")],
-    ])
-
 def ikb_calc_settings() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✈️ Ціна доставки авіа (за 1 кг, $)", callback_data="calcset:price_per_kg_avia")],
@@ -442,9 +365,34 @@ def ikb_calc_settings() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="💵 Змінити курс долара", callback_data="calcset:usd_rate")],
     ])
 
-def ikb_calc_actions(cid: int) -> InlineKeyboardMarkup:
+def ikb_calc_actions(cid: int, calc: dict | None = None) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text="✏️ Редагувати", callback_data=f"editcalc:{cid}")]]
+    link = (calc or {}).get("link", "")
+    if is_valid_link(link):
+        rows.append([InlineKeyboardButton(text="🔗 Посилання на товар", url=link.strip())])
+    rows.append([InlineKeyboardButton(text="🗑 Видалити", callback_data=f"delcalc:{cid}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def ikb_calc_edit_fields(cid: int) -> InlineKeyboardMarkup:
+    fields = [
+        ("name", "Назва"), ("description", "Опис"),
+        ("link", "Посилання"), ("rating", "Оцінка (0-10)"),
+        ("price_yuan", "Ціна (¥)"), ("weight_kg", "Вага (кг)"),
+    ]
+    rows = []
+    for i in range(0, len(fields), 2):
+        row = [InlineKeyboardButton(text=label, callback_data=f"editcalcfield:{cid}:{key}")
+               for key, label in fields[i:i+2]]
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="🚚 Спосіб доставки", callback_data=f"editcalcfield:{cid}:delivery_method")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def ikb_send_calc_filter() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🗑 Видалити", callback_data=f"delcalc:{cid}")],
+        [InlineKeyboardButton(text="🗂 Усі", callback_data="filtercalc:all")],
+        [InlineKeyboardButton(text="⭐ Мін. рейтинг", callback_data="filtercalc:rating")],
+        [InlineKeyboardButton(text="✈️ Тільки авіа", callback_data="filtercalc:avia")],
+        [InlineKeyboardButton(text="🚢 Тільки море", callback_data="filtercalc:sea")],
     ])
 
 def ikb_send_calc_list(calcs: list, selected_ids) -> InlineKeyboardMarkup:
@@ -458,6 +406,13 @@ def ikb_send_calc_list(calcs: list, selected_ids) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="✅ Готово", callback_data="selcalc_done")])
     rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="selcalc_cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def ikb_send_calc_action() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Переслати", callback_data="calcaction:send")],
+        [InlineKeyboardButton(text="💾 Зберегти CSV", callback_data="calcaction:save")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="calcaction:cancel")],
+    ])
 
 CALC_SETTING_LABELS = {
     "price_per_kg_avia": "ціну доставки авіа за 1 кг ($)",
@@ -487,15 +442,6 @@ async def require_auth(msg: Message, state: FSMContext) -> bool:
 
 @dp.errors()
 async def global_error_handler(event, exception=None):
-    """
-    Ловимо будь-яку необроблену помилку в хендлерах. Раніше тут лише логувалось
-    виключення і апдейт "проковтувався" мовчки - користувач бачив, що бот
-    "не реагує" (наприклад, натискає кнопку "Скасувати", а нічого не
-    відбувається). Тепер додатково намагаємось:
-      1) відповісти на callback_query (щоб прибрати "годинник"/спінер на кнопці),
-      2) надіслати користувачу повідомлення про помилку і повернути головне меню,
-      3) скинути FSM-стан, щоб бот не "завис" у проміжному кроці.
-    """
     exc = exception if exception is not None else getattr(event, "exception", None)
     logger.exception("Unhandled error while processing update: %s", exc)
     try:
@@ -503,10 +449,8 @@ async def global_error_handler(event, exception=None):
         if update is None:
             return True
         chat_id = None
-        uid = None
         if update.message:
             chat_id = update.message.chat.id
-            uid = update.message.from_user.id if update.message.from_user else None
         elif update.callback_query:
             cbq = update.callback_query
             try:
@@ -515,12 +459,6 @@ async def global_error_handler(event, exception=None):
                 pass
             if cbq.message:
                 chat_id = cbq.message.chat.id
-            uid = cbq.from_user.id if cbq.from_user else None
-        if uid is not None:
-            try:
-                state = FSMContext(storage=dp.storage, key=dp.resolve_used_update_types() and None)
-            except Exception:
-                state = None
         if chat_id is not None:
             try:
                 await bot.send_message(chat_id, GENERIC_ERROR_TEXT, reply_markup=kb_main())
@@ -574,10 +512,6 @@ async def ap_photo_cancel(msg: Message, state: FSMContext):
 
 @dp.message(AddProduct.photo, F.photo)
 async def ap_photo(msg: Message, state: FSMContext):
-    # Фото нікуди не завантажуємо - зберігаємо лише file_id, який Telegram
-    # вже назавжди зберігає на своїх серверах. Саме цей ідентифікатор і
-    # записується у MongoDB як "фото в БД" - без Cloudinary та без важких
-    # base64-блобів у документах.
     file_id = msg.photo[-1].file_id
     await state.update_data(photo_id=file_id)
     await state.set_state(AddProduct.name)
@@ -592,99 +526,6 @@ async def ap_name(msg: Message, state: FSMContext):
     if msg.text == "❌ Скасувати":
         await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
     await state.update_data(name=msg.text.strip())
-    await state.set_state(AddProduct.description)
-    await msg.answer("📝 Введіть *опис товару* (можна пропустити, якщо не потрібен):", reply_markup=kb_skip_cancel())
-
-@dp.message(AddProduct.description)
-async def ap_description(msg: Message, state: FSMContext):
-    if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
-    await state.update_data(description="" if msg.text == "⏩ Пропустити" else msg.text.strip())
-    await state.set_state(AddProduct.link)
-    await msg.answer(
-        "🔗 Введіть *посилання на товар* (наприклад https://...), можна пропустити:",
-        reply_markup=kb_skip_cancel(),
-    )
-
-@dp.message(AddProduct.link)
-async def ap_link(msg: Message, state: FSMContext):
-    if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
-    if msg.text == "⏩ Пропустити":
-        await state.update_data(link="")
-    else:
-        value = msg.text.strip()
-        if not is_valid_link(value):
-            return await msg.answer(
-                "⚠️ Посилання має починатись з *http://* або *https://*, або натисніть «⏩ Пропустити»:",
-                reply_markup=kb_skip_cancel(),
-            )
-        await state.update_data(link=value)
-    await state.set_state(AddProduct.sku)
-    await msg.answer("🔖 Введіть *артикул (SKU)*:", reply_markup=kb_cancel())
-
-@dp.message(AddProduct.sku)
-async def ap_sku(msg: Message, state: FSMContext):
-    if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
-    await state.update_data(sku=msg.text.strip())
-    categories = await get_categories()
-    await state.set_state(AddProduct.category)
-    if categories:
-        await msg.answer("🏷 Оберіть *категорію*:", reply_markup=kb_from_list(categories, with_manual=True))
-    else:
-        await msg.answer("🏷 Введіть *категорію*:", reply_markup=kb_cancel())
-
-@dp.message(AddProduct.category)
-async def ap_category(msg: Message, state: FSMContext):
-    if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
-    if msg.text == "✏️ Ввести вручну":
-        await state.set_state(AddProduct.category_manual)
-        return await msg.answer("🏷 Введіть категорію:", reply_markup=kb_cancel())
-    await _ap_category_save(msg, state, msg.text.strip())
-
-@dp.message(AddProduct.category_manual)
-async def ap_category_manual(msg: Message, state: FSMContext):
-    if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
-    await _ap_category_save(msg, state, msg.text.strip())
-
-async def _ap_category_save(msg: Message, state: FSMContext, category_value: str):
-    await state.update_data(category=category_value)
-    await state.set_state(AddProduct.size)
-    await msg.answer(f"✅ Категорія: *{category_value}*\n\n📏 Введіть *розмір*:", reply_markup=kb_skip_cancel())
-
-@dp.message(AddProduct.size)
-async def ap_size(msg: Message, state: FSMContext):
-    if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
-    await state.update_data(size="" if msg.text == "⏩ Пропустити" else msg.text.strip())
-    await state.set_state(AddProduct.color)
-    await msg.answer("🎨 Введіть *колір*:", reply_markup=kb_skip_cancel())
-
-@dp.message(AddProduct.color)
-async def ap_color(msg: Message, state: FSMContext):
-    if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
-    await state.update_data(color="" if msg.text == "⏩ Пропустити" else msg.text.strip())
-    await state.set_state(AddProduct.rating)
-    await msg.answer("⭐ Оцініть товар від *0 до 10* (або пропустіть):", reply_markup=kb_skip_cancel())
-
-@dp.message(AddProduct.rating)
-async def ap_rating(msg: Message, state: FSMContext):
-    if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
-    if msg.text == "⏩ Пропустити":
-        await state.update_data(rating="0")
-    else:
-        try:
-            val = int(msg.text.strip())
-        except ValueError:
-            return await msg.answer("⚠️ Введіть ціле число від 0 до 10, або пропустіть:", reply_markup=kb_skip_cancel())
-        if not (0 <= val <= 10):
-            return await msg.answer("⚠️ Оцінка має бути від 0 до 10:", reply_markup=kb_skip_cancel())
-        await state.update_data(rating=str(val))
     await state.set_state(AddProduct.cost_price)
     await msg.answer("💵 Введіть *собівартість* (грн):", reply_markup=kb_cancel())
 
@@ -692,34 +533,9 @@ async def ap_rating(msg: Message, state: FSMContext):
 async def ap_cost_price(msg: Message, state: FSMContext):
     if msg.text == "❌ Скасувати":
         await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
-    try:
-        float(msg.text.strip().replace(",", "."))
-    except ValueError:
-        return await msg.answer("⚠️ Введіть число, наприклад *150*:", reply_markup=kb_cancel())
-    await state.update_data(cost_price=msg.text.strip())
-    await state.set_state(AddProduct.sale_price)
-    await msg.answer("💰 Введіть *ціну продажу* (грн):", reply_markup=kb_cancel())
-
-@dp.message(AddProduct.sale_price)
-async def ap_sale_price(msg: Message, state: FSMContext):
-    if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
-    try:
-        float(msg.text.strip().replace(",", "."))
-    except ValueError:
-        return await msg.answer("⚠️ Введіть число, наприклад *300*:", reply_markup=kb_cancel())
-    await state.update_data(sale_price=msg.text.strip())
-    await state.set_state(AddProduct.stock_qty)
-    await msg.answer("📦 Введіть *кількість на складі*:", reply_markup=kb_cancel())
-
-@dp.message(AddProduct.stock_qty)
-async def ap_stock_qty(msg: Message, state: FSMContext):
-    if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
-    try:
-        int(msg.text.strip())
-    except ValueError:
-        return await msg.answer("⚠️ Введіть ціле число, наприклад *10*:", reply_markup=kb_cancel())
+    value = parse_float(msg.text)
+    if value <= 0:
+        return await msg.answer("⚠️ Введіть додатнє число, наприклад *150*:", reply_markup=kb_cancel())
 
     fd = await state.get_data()
     await state.clear()
@@ -727,30 +543,15 @@ async def ap_stock_qty(msg: Message, state: FSMContext):
         "id":         await next_product_id(),
         "photo_id":   fd.get("photo_id", ""),
         "name":       fd.get("name", ""),
-        "description": fd.get("description", ""),
-        "link":       fd.get("link", ""),
-        "sku":        fd.get("sku", ""),
-        "category":   fd.get("category", ""),
-        "size":       fd.get("size", ""),
-        "color":      fd.get("color", ""),
-        "rating":     fd.get("rating", "0"),
-        "status":     DEFAULT_STATUS,
-        "cost_price": fd.get("cost_price", ""),
-        "sale_price": fd.get("sale_price", ""),
-        "stock_qty":  msg.text.strip(),
+        "cost_price": value,
         "created_at": datetime.now().isoformat(),
         "created_by": msg.from_user.id,
     }
-    categories = await get_categories()
-    if product["category"] and product["category"] not in categories:
-        categories.append(product["category"])
-        await save_categories(categories)
-
     await add_product(product)
     await msg.answer_photo(
         photo=product["photo_id"],
         caption=f"✅ *Товар додано!*\n\n{fmt_product(product)}",
-        reply_markup=ikb_product_actions(product["id"], product),
+        reply_markup=ikb_product_actions(product["id"]),
     )
     await msg.answer("Готово ✅", reply_markup=kb_main())
 
@@ -820,7 +621,7 @@ async def view_product(cb: CallbackQuery):
         await cb.message.answer_photo(
             photo=product.get("photo_id") or None,
             caption=fmt_product(product),
-            reply_markup=ikb_product_actions(pid, product),
+            reply_markup=ikb_product_actions(pid),
         )
         await cb.answer()
     except Exception:
@@ -847,208 +648,6 @@ async def sold_product(cb: CallbackQuery):
         except TelegramAPIError:
             pass
 
-@dp.callback_query(F.data.startswith("delete:"))
-async def delete_product_cb(cb: CallbackQuery):
-    try:
-        pid = int(cb.data.split(":")[1])
-        product = await get_product(pid)
-        if not product:
-            return await cb.answer("Не знайдено!", show_alert=True)
-        await delete_product(pid)
-        await cb.message.edit_caption(caption=f"🗑 Товар №{pid} видалено.")
-        await cb.answer("Видалено!")
-    except Exception:
-        logger.exception("delete_product_cb failed")
-        try:
-            await cb.answer(DB_ERROR_TEXT, show_alert=True)
-        except TelegramAPIError:
-            pass
-
-@dp.callback_query(F.data.startswith("edit:"))
-async def edit_product_cb(cb: CallbackQuery):
-    try:
-        pid = int(cb.data.split(":")[1])
-        await cb.message.answer(f"✏️ *Редагування №{pid}*\nОберіть поле:", reply_markup=ikb_edit_fields(pid))
-        await cb.answer()
-    except Exception:
-        logger.exception("edit_product_cb failed")
-        try:
-            await cb.answer(DB_ERROR_TEXT, show_alert=True)
-        except TelegramAPIError:
-            pass
-
-@dp.callback_query(F.data.startswith("status:"))
-async def status_menu_cb(cb: CallbackQuery):
-    try:
-        pid = int(cb.data.split(":")[1])
-        product = await get_product(pid)
-        if not product:
-            return await cb.answer("Не знайдено!", show_alert=True)
-        await cb.message.answer(
-            f"📌 *Статус товару №{pid} — {product.get('name','')}*\nОберіть новий статус:",
-            reply_markup=ikb_status_options(pid),
-        )
-        await cb.answer()
-    except Exception:
-        logger.exception("status_menu_cb failed")
-        try:
-            await cb.answer(DB_ERROR_TEXT, show_alert=True)
-        except TelegramAPIError:
-            pass
-
-@dp.callback_query(F.data.startswith("setstatus:"))
-async def set_status_cb(cb: CallbackQuery):
-    try:
-        _, pid_s, key = cb.data.split(":", 2)
-        pid = int(pid_s)
-        product = await get_product(pid)
-        if not product:
-            return await cb.answer("Не знайдено!", show_alert=True)
-        meta = STATUS_META.get(key)
-        if not meta:
-            return await cb.answer("Невідомий статус", show_alert=True)
-
-        if key == "rejected":
-            # За вимогою: якщо товар відхилено - видаляємо його з бази.
-            await delete_product(pid)
-            await cb.message.answer(
-                f"❌ Товар №{pid} — «{product.get('name','')}» відхилено і видалено зі списку.",
-                reply_markup=kb_main(),
-            )
-            await cb.answer("Відхилено і видалено")
-            return
-
-        await update_product(pid, {"status": key})
-        product = await get_product(pid)
-        if product:
-            await cb.message.answer(
-                f"✅ Статус оновлено: {meta['emoji']} {meta['label']}\n\n{fmt_product(product)}",
-                reply_markup=ikb_product_actions(pid, product),
-            )
-        await cb.answer("Статус оновлено")
-    except Exception:
-        logger.exception("set_status_cb failed")
-        try:
-            await cb.answer(DB_ERROR_TEXT, show_alert=True)
-        except TelegramAPIError:
-            pass
-
-@dp.callback_query(F.data.startswith("editfield:"))
-async def edit_field_choose(cb: CallbackQuery, state: FSMContext):
-    try:
-        _, pid_s, field = cb.data.split(":", 2)
-        pid = int(pid_s)
-        labels = {
-            "name": "Назву", "description": "Опис", "link": "Посилання на товар",
-            "sku": "Артикул",
-            "category": "Категорію", "size": "Розмір", "color": "Колір",
-            "rating": "Оцінку (0-10)",
-            "cost_price": "Собівартість (грн)", "sale_price": "Ціну продажу (грн)",
-            "stock_qty": "Кількість на складі",
-        }
-        await state.set_state(EditField.typing)
-        await state.update_data(edit_pid=pid, edit_field=field)
-        hint = ""
-        if field == "link":
-            hint = "\n_Має починатись з http:// або https://. Щоб прибрати посилання — надішліть «-»._"
-        elif field in ("description",):
-            hint = "\n_Щоб прибрати опис — надішліть «-»._"
-        await cb.message.answer(f"Введіть нове значення для *{labels.get(field, field)}*:{hint}", reply_markup=kb_cancel())
-        await cb.answer()
-    except Exception:
-        logger.exception("edit_field_choose failed")
-        try:
-            await cb.answer(DB_ERROR_TEXT, show_alert=True)
-        except TelegramAPIError:
-            pass
-
-@dp.message(EditField.typing)
-async def edit_field_save(msg: Message, state: FSMContext):
-    if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
-    fd = await state.get_data()
-    pid, field = fd["edit_pid"], fd["edit_field"]
-    value = msg.text.strip()
-
-    # Поля, які можна очистити, надіславши "-"
-    if field in ("description", "link") and value == "-":
-        value = ""
-    elif field in ("cost_price", "sale_price"):
-        try:
-            float(value.replace(",", "."))
-        except ValueError:
-            return await msg.answer("⚠️ Введіть число:", reply_markup=kb_cancel())
-    elif field == "stock_qty":
-        try:
-            int(value)
-        except ValueError:
-            return await msg.answer("⚠️ Введіть ціле число:", reply_markup=kb_cancel())
-    elif field == "rating":
-        try:
-            rv = int(value)
-        except ValueError:
-            return await msg.answer("⚠️ Введіть ціле число від 0 до 10:", reply_markup=kb_cancel())
-        if not (0 <= rv <= 10):
-            return await msg.answer("⚠️ Оцінка має бути від 0 до 10:", reply_markup=kb_cancel())
-        value = str(rv)
-    elif field == "link" and value and not is_valid_link(value):
-        return await msg.answer(
-            "⚠️ Посилання має починатись з *http://* або *https://*, або надішліть «-», щоб прибрати його:",
-            reply_markup=kb_cancel(),
-        )
-
-    await state.clear()
-    await update_product(pid, {field: value})
-    if field == "category":
-        categories = await get_categories()
-        if value not in categories:
-            categories.append(value)
-            await save_categories(categories)
-    product = await get_product(pid)
-    if product:
-        await msg.answer_photo(
-            photo=product.get("photo_id") or None,
-            caption=f"✅ Оновлено!\n\n{fmt_product(product)}",
-            reply_markup=ikb_product_actions(pid, product),
-        )
-        await msg.answer("Готово ✅", reply_markup=kb_main())
-    else:
-        await msg.answer("Товар не знайдено.", reply_markup=kb_main())
-
-@dp.callback_query(F.data.startswith("editphoto:"))
-async def edit_photo_cb(cb: CallbackQuery, state: FSMContext):
-    try:
-        pid = int(cb.data.split(":")[1])
-        await state.set_state(EditField.typing)
-        await state.update_data(edit_pid=pid, edit_field="__photo__")
-        await cb.message.answer(f"📷 Надішліть нове фото для товару №{pid}:", reply_markup=kb_cancel())
-        await cb.answer()
-    except Exception:
-        logger.exception("edit_photo_cb failed")
-        try:
-            await cb.answer(DB_ERROR_TEXT, show_alert=True)
-        except TelegramAPIError:
-            pass
-
-@dp.message(EditField.typing, F.photo)
-async def edit_photo_save(msg: Message, state: FSMContext):
-    fd = await state.get_data()
-    if fd.get("edit_field") != "__photo__":
-        return
-    pid = fd["edit_pid"]
-    await state.clear()
-    file_id = msg.photo[-1].file_id
-    await update_product(pid, {"photo_id": file_id})
-    product = await get_product(pid)
-    if product:
-        await msg.answer_photo(
-            photo=file_id,
-            caption=f"✅ Фото оновлено!\n\n{fmt_product(product)}",
-            reply_markup=ikb_product_actions(pid, product),
-        )
-    else:
-        await msg.answer("Товар не знайдено.", reply_markup=kb_main())
-
 @dp.message(F.text == "🔍 За назвою")
 async def search_name_start(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
@@ -1063,45 +662,6 @@ async def search_name_do(msg: Message, state: FSMContext):
     q = msg.text.strip().lower()
     all_products = await get_all_products()
     found = [p for p in all_products if q in str(p.get("name", "")).lower()]
-    await _show_search_results(msg, found, q)
-
-@dp.message(F.text == "🔠 За артикулом")
-async def search_sku_start(msg: Message, state: FSMContext):
-    if not await require_auth(msg, state): return
-    await state.set_state(SearchSku.typing)
-    await msg.answer("🔠 Введіть *артикул* (або його частину):", reply_markup=kb_cancel())
-
-@dp.message(SearchSku.typing)
-async def search_sku_do(msg: Message, state: FSMContext):
-    if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
-    await state.clear()
-    q = msg.text.strip().lower()
-    all_products = await get_all_products()
-    found = [p for p in all_products if q in str(p.get("sku", "")).lower()]
-    await _show_search_results(msg, found, q)
-
-@dp.message(F.text == "🏷 За категорією")
-async def search_category_start(msg: Message, state: FSMContext):
-    if not await require_auth(msg, state): return
-    categories = await get_categories()
-    await state.set_state(SearchCategory.typing)
-    if categories:
-        await msg.answer("🏷 Оберіть категорію:", reply_markup=kb_from_list(categories))
-    else:
-        await msg.answer("🏷 Введіть назву категорії:", reply_markup=kb_cancel())
-
-@dp.message(SearchCategory.typing)
-async def search_category_do(msg: Message, state: FSMContext):
-    if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_main())
-    await state.clear()
-    q = msg.text.strip().lower()
-    all_products = await get_all_products()
-    found = [p for p in all_products if q in str(p.get("category", "")).lower()]
-    await _show_search_results(msg, found, q)
-
-async def _show_search_results(msg: Message, found: list, q: str):
     if not found:
         return await msg.answer(f"🔍 За запитом *{q}* нічого не знайдено.", reply_markup=kb_main())
     uid = msg.from_user.id
@@ -1109,72 +669,6 @@ async def _show_search_results(msg: Message, found: list, q: str):
     await msg.answer(f"🔍 Знайдено: *{len(found)}*", reply_markup=kb_main())
     await msg.answer("Результати:", reply_markup=ikb_products_list(found))
 
-@dp.message(F.text == "⚙️ Категорії")
-async def categories_menu(msg: Message, state: FSMContext):
-    if not await require_auth(msg, state): return
-    categories = await get_categories()
-    cats_txt = "\n".join(f"  • {c}" for c in categories) or "  (порожньо)"
-    await msg.answer(f"⚙️ *Категорії*\n\n{cats_txt}", reply_markup=ikb_categories_settings())
-
-@dp.callback_query(F.data == "cfg:add_cat")
-async def cfg_add_cat(cb: CallbackQuery, state: FSMContext):
-    try:
-        await state.set_state(AddCategory.typing)
-        await cb.message.answer("🏷 Введіть назву *нової категорії*:", reply_markup=kb_cancel())
-        await cb.answer()
-    except Exception:
-        logger.exception("cfg_add_cat failed")
-        try:
-            await cb.answer(DB_ERROR_TEXT, show_alert=True)
-        except TelegramAPIError:
-            pass
-
-@dp.message(AddCategory.typing)
-async def cfg_add_cat_save(msg: Message, state: FSMContext):
-    await state.clear()
-    if msg.text == "❌ Скасувати": return await msg.answer("Скасовано.", reply_markup=kb_main())
-    val = msg.text.strip()
-    categories = await get_categories()
-    if val in categories:
-        await msg.answer(f"⚠️ Категорія *{val}* вже є.", reply_markup=kb_main())
-    else:
-        categories.append(val)
-        await save_categories(categories)
-        await msg.answer(f"✅ Категорія *{val}* додана!\n\n" + "\n".join(f"  • {c}" for c in categories),
-                         reply_markup=kb_main())
-
-@dp.callback_query(F.data == "cfg:del_cat")
-async def cfg_del_cat(cb: CallbackQuery, state: FSMContext):
-    try:
-        categories = await get_categories()
-        if not categories: return await cb.answer("Список порожній!", show_alert=True)
-        await state.set_state(DelCategory.choosing)
-        await cb.message.answer("🗑 Оберіть категорію для видалення:", reply_markup=kb_from_list(categories))
-        await cb.answer()
-    except Exception:
-        logger.exception("cfg_del_cat failed")
-        try:
-            await cb.answer(DB_ERROR_TEXT, show_alert=True)
-        except TelegramAPIError:
-            pass
-
-@dp.message(DelCategory.choosing)
-async def cfg_del_cat_do(msg: Message, state: FSMContext):
-    await state.clear()
-    if msg.text == "❌ Скасувати": return await msg.answer("Скасовано.", reply_markup=kb_main())
-    val = msg.text.strip()
-    categories = await get_categories()
-    if val in categories:
-        categories.remove(val)
-        await save_categories(categories)
-        cats_txt = "\n".join(f"  • {c}" for c in categories) or "  (порожньо)"
-        await msg.answer(f"🗑 Категорія *{val}* видалена.\n\n{cats_txt}", reply_markup=kb_main())
-    else:
-        await msg.answer("Не знайдено.", reply_markup=kb_main())
-
-# ---------------------------------------------------------------------------
-# CSV експорт товарів
-# ---------------------------------------------------------------------------
 @dp.message(F.text == "📤 CSV товарів")
 async def export_products_csv(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
@@ -1185,22 +679,9 @@ async def export_products_csv(msg: Message, state: FSMContext):
 
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow([
-            "id", "name", "sku", "category", "size", "color",
-            "description", "link", "rating", "status", "cost_price", "sale_price",
-            "stock_qty", "created_at",
-        ])
+        writer.writerow(["id", "name", "cost_price", "created_at"])
         for p in products:
-            status_key = p.get("status") or DEFAULT_STATUS
-            status_label = STATUS_META.get(status_key, STATUS_META[DEFAULT_STATUS])["label"]
-            writer.writerow([
-                p.get("id", ""), p.get("name", ""), p.get("sku", ""),
-                p.get("category", ""), p.get("size", ""), p.get("color", ""),
-                p.get("description", ""), p.get("link", ""), p.get("rating", "0"), status_label,
-                p.get("cost_price", ""),
-                p.get("sale_price", ""), p.get("stock_qty", ""), p.get("created_at", ""),
-            ])
-        # utf-8-sig, щоб Excel коректно показував кирилицю
+            writer.writerow([p.get("id", ""), p.get("name", ""), p.get("cost_price", ""), p.get("created_at", "")])
         csv_bytes = output.getvalue().encode("utf-8-sig")
         filename = f"products_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
         file = BufferedInputFile(csv_bytes, filename=filename)
@@ -1210,9 +691,6 @@ async def export_products_csv(msg: Message, state: FSMContext):
         logger.exception("export_products_csv failed")
         await msg.answer(DB_ERROR_TEXT, reply_markup=kb_main())
 
-# ---------------------------------------------------------------------------
-# Калькулятор
-# ---------------------------------------------------------------------------
 @dp.message(F.text == "🧮 Калькулятор")
 async def calc_menu(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
@@ -1307,6 +785,48 @@ async def calc_name(msg: Message, state: FSMContext):
     if msg.text == "❌ Скасувати":
         await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
     await state.update_data(calc_name=msg.text.strip())
+    await state.set_state(CalcProduct.description)
+    await msg.answer("📝 Введіть *опис товару* (можна пропустити):", reply_markup=kb_skip_cancel())
+
+@dp.message(CalcProduct.description)
+async def calc_description(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+    await state.update_data(calc_description="" if msg.text == "⏩ Пропустити" else msg.text.strip())
+    await state.set_state(CalcProduct.link)
+    await msg.answer("🔗 Введіть *посилання на товар* (можна пропустити):", reply_markup=kb_skip_cancel())
+
+@dp.message(CalcProduct.link)
+async def calc_link(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+    if msg.text == "⏩ Пропустити":
+        await state.update_data(calc_link="")
+    else:
+        value = msg.text.strip()
+        if not is_valid_link(value):
+            return await msg.answer(
+                "⚠️ Посилання має починатись з *http://* або *https://*, або натисніть «⏩ Пропустити»:",
+                reply_markup=kb_skip_cancel(),
+            )
+        await state.update_data(calc_link=value)
+    await state.set_state(CalcProduct.rating)
+    await msg.answer("⭐ Оцініть товар від *0 до 10* (можна пропустити):", reply_markup=kb_skip_cancel())
+
+@dp.message(CalcProduct.rating)
+async def calc_rating(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+    if msg.text == "⏩ Пропустити":
+        await state.update_data(calc_rating="0")
+    else:
+        try:
+            rv = int(msg.text.strip())
+        except ValueError:
+            return await msg.answer("⚠️ Введіть ціле число від 0 до 10, або пропустіть:", reply_markup=kb_skip_cancel())
+        if not (0 <= rv <= 10):
+            return await msg.answer("⚠️ Оцінка має бути від 0 до 10:", reply_markup=kb_skip_cancel())
+        await state.update_data(calc_rating=str(rv))
     await state.set_state(CalcProduct.price_yuan)
     await msg.answer("💴 Введіть *ціну товару в юанях*:", reply_markup=kb_cancel())
 
@@ -1342,17 +862,18 @@ async def calc_delivery_method(msg: Message, state: FSMContext):
     method = "avia" if msg.text == "✈️ Авіа" else "sea"
     fd = await state.get_data()
     name = fd["calc_name"]
+    description = fd.get("calc_description", "")
+    link = fd.get("calc_link", "")
+    rating = fd.get("calc_rating", "0")
     price_yuan = fd["calc_price_yuan"]
     weight = fd["calc_weight"]
     photo_id = fd.get("calc_photo_id", "")
     await state.clear()
 
     s = await get_calc_settings()
-    # Ціна доставки за 1 кг зберігається в доларах.
     rate_per_kg_usd = s["price_per_kg_avia"] if method == "avia" else s["price_per_kg_sea"]
     delivery_cost_usd = weight * rate_per_kg_usd
     delivery_cost_uah = delivery_cost_usd * s["usd_rate"]
-
     price_uah = price_yuan * s["yuan_rate"]
     cost_price_uah = price_uah + delivery_cost_uah
     cost_price_usd = cost_price_uah / s["usd_rate"] if s["usd_rate"] else 0.0
@@ -1360,6 +881,9 @@ async def calc_delivery_method(msg: Message, state: FSMContext):
     record = {
         "id":                await next_calc_id(),
         "name":              name,
+        "description":       description,
+        "link":              link,
+        "rating":            rating,
         "photo_id":          photo_id,
         "price_yuan":        price_yuan,
         "price_uah":         price_uah,
@@ -1375,9 +899,9 @@ async def calc_delivery_method(msg: Message, state: FSMContext):
     await add_calc(record)
 
     if photo_id:
-        await msg.answer_photo(photo=photo_id, caption=fmt_calc(record), reply_markup=ikb_calc_actions(record["id"]))
+        await msg.answer_photo(photo=photo_id, caption=fmt_calc(record), reply_markup=ikb_calc_actions(record["id"], record))
     else:
-        await msg.answer(fmt_calc(record), reply_markup=ikb_calc_actions(record["id"]))
+        await msg.answer(fmt_calc(record), reply_markup=ikb_calc_actions(record["id"], record))
     await msg.answer("Готово ✅ Розрахунок збережено.", reply_markup=kb_calc_menu())
 
 @dp.message(F.text == "📄 Мої розрахунки")
@@ -1389,9 +913,120 @@ async def list_calcs(msg: Message, state: FSMContext):
     await msg.answer(f"📄 *Розрахунки* — {len(calcs)} шт.", reply_markup=kb_calc_menu())
     for c in calcs:
         if c.get("photo_id"):
-            await msg.answer_photo(photo=c["photo_id"], caption=fmt_calc(c), reply_markup=ikb_calc_actions(c["id"]))
+            await msg.answer_photo(photo=c["photo_id"], caption=fmt_calc(c), reply_markup=ikb_calc_actions(c["id"], c))
         else:
-            await msg.answer(fmt_calc(c), reply_markup=ikb_calc_actions(c["id"]))
+            await msg.answer(fmt_calc(c), reply_markup=ikb_calc_actions(c["id"], c))
+
+@dp.callback_query(F.data.startswith("editcalc:"))
+async def editcalc_cb(cb: CallbackQuery):
+    try:
+        cid = int(cb.data.split(":")[1])
+        await cb.message.answer(f"✏️ *Редагування розрахунку №{cid}*\nОберіть поле:", reply_markup=ikb_calc_edit_fields(cid))
+        await cb.answer()
+    except Exception:
+        logger.exception("editcalc_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data.startswith("editcalcfield:"))
+async def editcalcfield_choose(cb: CallbackQuery, state: FSMContext):
+    try:
+        _, cid_s, field = cb.data.split(":", 2)
+        cid = int(cid_s)
+        if field == "delivery_method":
+            await state.set_state(CalcEditField.typing_delivery)
+            await state.update_data(edit_cid=cid)
+            await cb.message.answer("🚚 Оберіть новий спосіб доставки:", reply_markup=kb_delivery_method())
+        else:
+            await state.set_state(CalcEditField.typing)
+            await state.update_data(edit_cid=cid, edit_field=field)
+            labels = {
+                "name": "Назву", "description": "Опис", "link": "Посилання на товар",
+                "rating": "Оцінку (0-10)", "price_yuan": "Ціну товару (¥)", "weight_kg": "Вагу (кг)",
+            }
+            hint = ""
+            if field == "link":
+                hint = "\n_Має починатись з http:// або https://. Щоб прибрати посилання — надішліть «-»._"
+            elif field == "description":
+                hint = "\n_Щоб прибрати опис — надішліть «-»._"
+            await cb.message.answer(f"Введіть нове значення для *{labels.get(field, field)}*:{hint}", reply_markup=kb_cancel())
+        await cb.answer()
+    except Exception:
+        logger.exception("editcalcfield_choose failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.message(CalcEditField.typing)
+async def editcalcfield_save(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+    fd = await state.get_data()
+    cid, field = fd["edit_cid"], fd["edit_field"]
+    value = msg.text.strip()
+    update_fields = {}
+
+    if field in ("description", "link") and value == "-":
+        value = ""
+    if field == "link" and value and not is_valid_link(value):
+        return await msg.answer(
+            "⚠️ Посилання має починатись з *http://* або *https://*, або надішліть «-»:",
+            reply_markup=kb_cancel(),
+        )
+    if field == "rating":
+        try:
+            rv = int(value)
+        except ValueError:
+            return await msg.answer("⚠️ Введіть ціле число від 0 до 10:", reply_markup=kb_cancel())
+        if not (0 <= rv <= 10):
+            return await msg.answer("⚠️ Оцінка має бути від 0 до 10:", reply_markup=kb_cancel())
+        value = str(rv)
+    if field in ("price_yuan", "weight_kg"):
+        fv = parse_float(value)
+        if fv <= 0:
+            return await msg.answer("⚠️ Введіть додатнє число:", reply_markup=kb_cancel())
+        update_fields[field] = fv
+    else:
+        update_fields[field] = value
+
+    await state.clear()
+    await update_calc(cid, update_fields)
+    if field in ("price_yuan", "weight_kg"):
+        await recalc_calc_costs(cid)
+    record = await get_calc(cid)
+    if record:
+        if record.get("photo_id"):
+            await msg.answer_photo(photo=record["photo_id"], caption=f"✅ Оновлено!\n\n{fmt_calc(record)}", reply_markup=ikb_calc_actions(cid, record))
+        else:
+            await msg.answer(f"✅ Оновлено!\n\n{fmt_calc(record)}", reply_markup=ikb_calc_actions(cid, record))
+        await msg.answer("Готово ✅", reply_markup=kb_calc_menu())
+    else:
+        await msg.answer("Розрахунок не знайдено.", reply_markup=kb_calc_menu())
+
+@dp.message(CalcEditField.typing_delivery)
+async def editcalcfield_delivery_save(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+    if msg.text not in ("✈️ Авіа", "🚢 Море"):
+        return await msg.answer("Оберіть спосіб доставки кнопкою нижче:", reply_markup=kb_delivery_method())
+    method = "avia" if msg.text == "✈️ Авіа" else "sea"
+    fd = await state.get_data()
+    cid = fd["edit_cid"]
+    await state.clear()
+    await update_calc(cid, {"delivery_method": method})
+    await recalc_calc_costs(cid)
+    record = await get_calc(cid)
+    if record:
+        if record.get("photo_id"):
+            await msg.answer_photo(photo=record["photo_id"], caption=f"✅ Оновлено!\n\n{fmt_calc(record)}", reply_markup=ikb_calc_actions(cid, record))
+        else:
+            await msg.answer(f"✅ Оновлено!\n\n{fmt_calc(record)}", reply_markup=ikb_calc_actions(cid, record))
+        await msg.answer("Готово ✅", reply_markup=kb_calc_menu())
+    else:
+        await msg.answer("Розрахунок не знайдено.", reply_markup=kb_calc_menu())
 
 @dp.callback_query(F.data.startswith("delcalc:"))
 async def delete_calc_cb(cb: CallbackQuery):
@@ -1411,35 +1046,71 @@ async def delete_calc_cb(cb: CallbackQuery):
         except TelegramAPIError:
             pass
 
-# ---------------------------------------------------------------------------
-# Пересилання розрахунків іншому користувачу по username
-# (отримувач має спершу написати боту /start, щоб бот знав його chat_id)
-#
-# ВАЖЛИВО (фікс): раніше під час вибору розрахунків (SendCalc.choosing)
-# reply-клавіатура не мала кнопки "❌ Скасувати" і не було жодного текстового
-# обробника для цього стану - якщо людина писала/тиснула "Скасувати" не через
-# inline-кнопку в списку, бот просто мовчав. Тепер:
-#   1) одразу показуємо звичайну (reply) клавіатуру з кнопкою "❌ Скасувати",
-#   2) додано текстовий обробник для стану SendCalc.choosing,
-#   3) кеш send_calc_cache чиститься при будь-якому виході з флоу.
-# ---------------------------------------------------------------------------
-@dp.message(F.text == "📤 Переслати розрахунки")
+async def _proceed_to_choosing(target, state: FSMContext, filtered: list, uid: int):
+    if not filtered:
+        await state.clear()
+        send_calc_cache.pop(uid, None)
+        return await target.answer("📭 Немає розрахунків за цим критерієм.", reply_markup=kb_calc_menu())
+    send_calc_cache[uid] = filtered
+    await state.set_state(SendCalc.choosing)
+    await state.update_data(send_selected=[])
+    await target.answer(
+        f"Знайдено *{len(filtered)}* — оберіть потрібні кнопками нижче (можна декілька, або «Обрати всі»):",
+        reply_markup=kb_cancel(),
+    )
+    await target.answer("Список розрахунків:", reply_markup=ikb_send_calc_list(filtered, []))
+
+@dp.message(F.text == "📤 Переслати/Зберегти")
 async def send_calc_start(msg: Message, state: FSMContext):
     if not await require_auth(msg, state): return
     calcs = await get_all_calcs()
     if not calcs:
         return await msg.answer("📭 Розрахунків ще немає.", reply_markup=kb_calc_menu())
-    uid = msg.from_user.id
-    send_calc_cache[uid] = calcs
-    await state.set_state(SendCalc.choosing)
-    await state.update_data(send_selected=[])
-    await msg.answer(
-        "📤 Оберіть розрахунки для пересилання кнопками у списку нижче "
-        "(можна декілька, або «Обрати всі»).\n"
-        "Для скасування - кнопка ❌ Скасувати.",
-        reply_markup=kb_cancel(),
-    )
-    await msg.answer("Список розрахунків:", reply_markup=ikb_send_calc_list(calcs, []))
+    await state.set_state(SendCalc.filter_choice)
+    await msg.answer("📤 Оберіть критерій фільтра розрахунків нижче.", reply_markup=kb_cancel())
+    await msg.answer("Критерій:", reply_markup=ikb_send_calc_filter())
+
+@dp.message(SendCalc.filter_choice)
+async def send_calc_filter_text(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+    await msg.answer("Оберіть критерій кнопками вище, або натисніть ❌ Скасувати.", reply_markup=kb_cancel())
+
+@dp.callback_query(F.data.startswith("filtercalc:"), SendCalc.filter_choice)
+async def filtercalc_choose(cb: CallbackQuery, state: FSMContext):
+    try:
+        criterion = cb.data.split(":", 1)[1]
+        uid = cb.from_user.id
+        calcs = await get_all_calcs()
+        if criterion == "all":
+            await _proceed_to_choosing(cb.message, state, calcs, uid)
+        elif criterion == "rating":
+            await state.set_state(SendCalc.filter_rating)
+            await cb.message.answer("⭐ Введіть мінімальний рейтинг (0-10):", reply_markup=kb_cancel())
+        elif criterion in ("avia", "sea"):
+            filtered = [c for c in calcs if c.get("delivery_method") == criterion]
+            await _proceed_to_choosing(cb.message, state, filtered, uid)
+        await cb.answer()
+    except Exception:
+        logger.exception("filtercalc_choose failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.message(SendCalc.filter_rating)
+async def filter_rating_do(msg: Message, state: FSMContext):
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
+    try:
+        threshold = int(msg.text.strip())
+    except ValueError:
+        return await msg.answer("⚠️ Введіть ціле число від 0 до 10:", reply_markup=kb_cancel())
+    if not (0 <= threshold <= 10):
+        return await msg.answer("⚠️ Рейтинг має бути від 0 до 10:", reply_markup=kb_cancel())
+    calcs = await get_all_calcs()
+    filtered = [c for c in calcs if parse_int(c.get("rating", 0)) >= threshold]
+    await _proceed_to_choosing(msg, state, filtered, msg.from_user.id)
 
 @dp.callback_query(F.data.startswith("selcalc:"), SendCalc.choosing)
 async def toggle_selcalc(cb: CallbackQuery, state: FSMContext):
@@ -1506,12 +1177,8 @@ async def selcalc_done(cb: CallbackQuery, state: FSMContext):
         selected = fd.get("send_selected", [])
         if not selected:
             return await cb.answer("Оберіть хоча б один розрахунок!", show_alert=True)
-        await state.set_state(SendCalc.waiting_username)
-        await cb.message.answer(
-            "👤 Введіть *username* отримувача (наприклад, @username).\n"
-            "Отримувач має бути хоча б раз написати боту /start.",
-            reply_markup=kb_cancel(),
-        )
+        await state.set_state(SendCalc.action_choice)
+        await cb.message.answer("Що зробити з обраними розрахунками?", reply_markup=ikb_send_calc_action())
         await cb.answer()
     except Exception:
         logger.exception("selcalc_done failed")
@@ -1520,19 +1187,69 @@ async def selcalc_done(cb: CallbackQuery, state: FSMContext):
         except TelegramAPIError:
             pass
 
-@dp.message(SendCalc.choosing)
-async def send_calc_choosing_text(msg: Message, state: FSMContext):
-    # Текстовий фолбек для стану вибору розрахунків: якщо людина тисне
-    # reply-кнопку "❌ Скасувати" замість inline-кнопки в списку - раніше бот
-    # ніяк на це не реагував. Тепер обробляємо явно.
+@dp.message(SendCalc.action_choice)
+async def send_calc_action_text(msg: Message, state: FSMContext):
     if msg.text == "❌ Скасувати":
         await state.clear()
         send_calc_cache.pop(msg.from_user.id, None)
         return await msg.answer("Скасовано.", reply_markup=kb_calc_menu())
-    await msg.answer(
-        "Будь ласка, оберіть розрахунки кнопками у списку вище, або натисніть ❌ Скасувати.",
-        reply_markup=kb_cancel(),
-    )
+    await msg.answer("Оберіть дію кнопками вище, або натисніть ❌ Скасувати.", reply_markup=kb_cancel())
+
+@dp.callback_query(F.data == "calcaction:send", SendCalc.action_choice)
+async def calcaction_send(cb: CallbackQuery, state: FSMContext):
+    try:
+        await state.set_state(SendCalc.waiting_username)
+        await cb.message.answer(
+            "👤 Введіть *username* отримувача (наприклад, @username).\n"
+            "Отримувач має бути хоча б раз написати боту /start.",
+            reply_markup=kb_cancel(),
+        )
+        await cb.answer()
+    except Exception:
+        logger.exception("calcaction_send failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data == "calcaction:save", SendCalc.action_choice)
+async def calcaction_save(cb: CallbackQuery, state: FSMContext):
+    try:
+        fd = await state.get_data()
+        selected_ids = set(fd.get("send_selected", []))
+        await state.clear()
+        uid = cb.from_user.id
+        send_calc_cache.pop(uid, None)
+        all_calcs = await get_all_calcs()
+        to_save = [c for c in all_calcs if c["id"] in selected_ids]
+        if not to_save:
+            return await cb.message.answer("⚠️ Обрані розрахунки не знайдено.", reply_markup=kb_calc_menu())
+        csv_bytes = build_calc_csv(to_save)
+        filename = f"calcs_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+        file = BufferedInputFile(csv_bytes, filename=filename)
+        await cb.message.answer_document(document=file, caption=f"💾 Збережено — {len(to_save)} шт.")
+        await cb.message.answer("Готово ✅", reply_markup=kb_calc_menu())
+        await cb.answer()
+    except Exception:
+        logger.exception("calcaction_save failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data == "calcaction:cancel", SendCalc.action_choice)
+async def calcaction_cancel(cb: CallbackQuery, state: FSMContext):
+    try:
+        await state.clear()
+        send_calc_cache.pop(cb.from_user.id, None)
+        await cb.message.answer("Скасовано.", reply_markup=kb_calc_menu())
+        await cb.answer()
+    except Exception:
+        logger.exception("calcaction_cancel failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
 
 @dp.message(SendCalc.waiting_username)
 async def send_calc_do(msg: Message, state: FSMContext):
@@ -1574,15 +1291,6 @@ async def send_calc_do(msg: Message, state: FSMContext):
 
     await msg.answer(f"📤 Надіслано {sent}/{len(to_send)} розрахунків користувачу {username}.", reply_markup=kb_calc_menu())
 
-# ---------------------------------------------------------------------------
-# Фолбек-хендлери (реєструються останніми!). Раніше, якщо апдейт не збігався
-# з жодним із зареєстрованих хендлерів (наприклад, через неочікуваний стан
-# FSM), aiogram просто мовчки ігнорував його - для користувача це виглядало
-# як "бот не реагує". Тепер:
-#   - будь-яке необроблене текстове повідомлення повертає в головне меню;
-#   - будь-який необроблений callback_query отримує відповідь (це критично:
-#     інакше кнопка в Telegram "крутиться" з годинником нескінченно).
-# ---------------------------------------------------------------------------
 @dp.message()
 async def fallback_message_handler(msg: Message, state: FSMContext):
     if not await require_auth(msg, state):
