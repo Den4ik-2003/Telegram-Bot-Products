@@ -205,6 +205,11 @@ async def recalc_calc_costs(cid: int):
     await update_calc(cid, fields)
     return await get_calc(cid)
 
+async def recalc_all_calcs():
+    calcs = await get_all_calcs()
+    for c in calcs:
+        await recalc_calc_costs(c["id"])
+
 async def next_basket_id() -> int:
     doc = await db_call(baskets_col.find_one(sort=[("id", -1)]))
     return (doc["id"] + 1) if doc else 1
