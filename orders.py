@@ -3,6 +3,7 @@ import csv
 import io
 import logging
 import os
+import uuid
 from datetime import datetime
 
 from aiogram import Bot, Dispatcher, F
@@ -29,7 +30,7 @@ logger = logging.getLogger("products_bot")
 
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
 BOT_PASSWORD  = os.environ["BOT_PASSWORD"]
-CALC_PASSWORD = os.environ["CALC_PASSWORD"]  # пароль з доступом ЛИШЕ до розділу "Калькулятор"
+CALC_PASSWORD = os.environ["CALC_PASSWORD"]
 MONGO_URI     = os.environ["MONGO_URI"]
 
 mongo_client: AsyncIOMotorClient | None = None
@@ -70,15 +71,7 @@ async def db_call(coro, default=None):
         logger.exception("MongoDB error")
         return default
 
-# ---------------------------------------------------------------------------
-# Авторизація / ролі
-#
-# Ролі:
-#   "full" — повний доступ (усі розділи: товари + калькулятор)
-#   "calc" — доступ ЛИШЕ до розділу "Калькулятор" (авторизація через CALC_PASSWORD)
-# ---------------------------------------------------------------------------
-
-user_roles: dict[int, str] = {}  # uid -> "full" | "calc"  (кеш у пам'яті)
+user_roles: dict[int, str] = {}
 
 async def load_user_roles():
     global user_roles
@@ -90,7 +83,6 @@ async def load_user_roles():
         logger.exception("Не вдалось завантажити список авторизованих користувачів")
 
 async def get_role(uid: int):
-    """Повертає 'full' | 'calc' | None (не авторизований) | 'ERROR' (помилка БД)."""
     if uid in user_roles:
         return user_roles[uid]
     try:
@@ -105,7 +97,6 @@ async def get_role(uid: int):
     return None
 
 def cached_role(uid: int) -> str:
-    """Синхронний доступ до вже відомої ролі (для внутрішньої навігації всередині FSM)."""
     return user_roles.get(uid, "full")
 
 async def authorize(uid: int, role: str = "full") -> bool:
@@ -190,40 +181,29 @@ async def update_calc(cid: int, fields: dict):
 
 async def delete_calc(cid: int):
     await db_call(calc_col.delete_one({"id": cid}))
-    # прибираємо посилання на цей розрахунок з усіх кошиків, щоб не лишалось "мертвих" id
-    await db_call(baskets_col.update_many({}, {"$pull": {"calc_ids": cid}}))
+    await db_call(baskets_col.update_many({}, {"$pull": {"items": {"calc_id": cid}}}))
 
 async def recalc_calc_costs(cid: int):
     record = await get_calc(cid)
     if not record:
         return None
     s = await get_calc_settings()
-    method = record.get("delivery_method", "avia")
-    rate_per_kg_usd = s["price_per_kg_avia"] if method == "avia" else s["price_per_kg_sea"]
     weight = parse_float(record.get("weight_kg", 0))
     price_yuan = parse_float(record.get("price_yuan", 0))
-    delivery_cost_usd = weight * rate_per_kg_usd
-    delivery_cost_uah = delivery_cost_usd * s["usd_rate"]
     price_uah = price_yuan * s["yuan_rate"]
-    cost_price_uah = price_uah + delivery_cost_uah
-    cost_price_usd = cost_price_uah / s["usd_rate"] if s["usd_rate"] else 0.0
-    fields = {
-        "price_uah": price_uah,
-        "delivery_cost_usd": delivery_cost_usd,
-        "delivery_cost_uah": delivery_cost_uah,
-        "cost_price_uah": cost_price_uah,
-        "cost_price_usd": cost_price_usd,
-    }
+    fields = {"price_uah": price_uah}
+    for method in ("avia", "sea"):
+        rate_per_kg_usd = s["price_per_kg_avia"] if method == "avia" else s["price_per_kg_sea"]
+        delivery_cost_usd = weight * rate_per_kg_usd
+        delivery_cost_uah = delivery_cost_usd * s["usd_rate"]
+        cost_price_uah = price_uah + delivery_cost_uah
+        cost_price_usd = cost_price_uah / s["usd_rate"] if s["usd_rate"] else 0.0
+        fields[f"delivery_cost_usd_{method}"] = delivery_cost_usd
+        fields[f"delivery_cost_uah_{method}"] = delivery_cost_uah
+        fields[f"cost_price_uah_{method}"] = cost_price_uah
+        fields[f"cost_price_usd_{method}"] = cost_price_usd
     await update_calc(cid, fields)
     return await get_calc(cid)
-
-# ---------------------------------------------------------------------------
-# Кошики (бюджети)
-#
-# У кошику зберігаються ЛИШЕ id розрахунків (calc_ids), а не копії самих
-# товарів — так один кошик займає мінімум місця в базі, і кошиків можна
-# створювати скільки завгодно.
-# ---------------------------------------------------------------------------
 
 async def next_basket_id() -> int:
     doc = await db_call(baskets_col.find_one(sort=[("id", -1)]))
@@ -242,11 +222,11 @@ async def get_all_baskets() -> list:
 async def delete_basket(bid: int):
     await db_call(baskets_col.delete_one({"id": bid}))
 
-async def basket_add_calc(bid: int, cid: int):
-    await db_call(baskets_col.update_one({"id": bid}, {"$addToSet": {"calc_ids": cid}}))
+async def basket_add_item(bid: int, item: dict):
+    await db_call(baskets_col.update_one({"id": bid}, {"$push": {"items": item}}))
 
-async def basket_remove_calc(bid: int, cid: int):
-    await db_call(baskets_col.update_one({"id": bid}, {"$pull": {"calc_ids": cid}}))
+async def basket_remove_item(bid: int, item_id: str):
+    await db_call(baskets_col.update_one({"id": bid}, {"$pull": {"items": {"item_id": item_id}}}))
 
 async def calcs_map_by_id(ids: list) -> dict:
     ids = list(set(ids))
@@ -287,29 +267,50 @@ DELIVERY_METHOD_LABELS = {"avia": "✈️ Авіа", "sea": "🚢 Море"}
 
 def fmt_calc(c: dict) -> str:
     rating = max(0, min(10, parse_int(c.get("rating", 0))))
-    method_label = DELIVERY_METHOD_LABELS.get(c.get("delivery_method", ""), "—")
-    delivery_usd = c.get("delivery_cost_usd")
-    delivery_usd_part = f" ({delivery_usd:,.2f} $)" if delivery_usd is not None else ""
-    price_uah = c.get("price_uah")
-    price_uah_part = f" (*{price_uah:,.0f} грн*)" if price_uah is not None else ""
     lines = [f"*№{c.get('id')} — {c.get('name','')}*"]
     if c.get("description"):
         lines.append(f"📝 {c['description']}")
     lines.append(f"⭐ Оцінка: {fmt_stars(rating)}")
-    lines += [
-        f"💴 Ціна товару: *{c.get('price_yuan',0):,.2f} ¥*{price_uah_part}",
-        f"⚖️ Вага: *{c.get('weight_kg',0):,.2f} кг*",
-        f"🚚 Доставка ({method_label}): *{c.get('delivery_cost_uah',0):,.0f} грн*{delivery_usd_part}",
-        f"💰 Собівартість: *{c.get('cost_price_uah',0):,.0f} грн* "
-        f"(*{c.get('cost_price_usd',0):,.2f} $*)",
-    ]
+    lines.append(f"💴 Ціна товару: *{c.get('price_yuan',0):,.2f} ¥* (*{c.get('price_uah',0):,.0f} грн*)")
+    lines.append(f"⚖️ Вага: *{c.get('weight_kg',0):,.2f} кг*")
+    lines.append("")
+    lines.append(
+        f"✈️ *Авіа* — доставка {c.get('delivery_cost_uah_avia',0):,.0f} грн "
+        f"({c.get('delivery_cost_usd_avia',0):,.2f} $)"
+    )
+    lines.append(
+        f"   Собівартість: *{c.get('cost_price_uah_avia',0):,.0f} грн* "
+        f"(*{c.get('cost_price_usd_avia',0):,.2f} $*)"
+    )
+    lines.append(
+        f"🚢 *Море* — доставка {c.get('delivery_cost_uah_sea',0):,.0f} грн "
+        f"({c.get('delivery_cost_usd_sea',0):,.2f} $)"
+    )
+    lines.append(
+        f"   Собівартість: *{c.get('cost_price_uah_sea',0):,.0f} грн* "
+        f"(*{c.get('cost_price_usd_sea',0):,.2f} $*)"
+    )
     if c.get("link"):
+        lines.append("")
         lines.append("🔗 Посилання на товар додано (кнопка нижче)")
     return "\n".join(lines)
 
 def fmt_basket(b: dict, calcs_by_id: dict) -> str:
-    items = [calcs_by_id[cid] for cid in b.get("calc_ids", []) if cid in calcs_by_id]
-    total = sum(parse_float(c.get("cost_price_uah", 0)) for c in items)
+    items = b.get("items", [])
+    total = 0.0
+    item_lines = []
+    for it in items:
+        c = calcs_by_id.get(it["calc_id"])
+        if not c:
+            continue
+        unit_cost = parse_float(c.get(f"cost_price_uah_{it['method']}", 0))
+        qty = it.get("qty", 1)
+        line_total = unit_cost * qty
+        total += line_total
+        method_label = DELIVERY_METHOD_LABELS.get(it["method"], "—")
+        item_lines.append(
+            f"• №{it['calc_id']} {c.get('name','')} x{qty} {method_label} — {line_total:,.0f} грн"
+        )
     budget = parse_float(b.get("budget", 0))
     remaining = budget - total
     status = "✅ У межах бюджету" if remaining >= 0 else "⚠️ Бюджет перевищено"
@@ -318,29 +319,30 @@ def fmt_basket(b: dict, calcs_by_id: dict) -> str:
         f"💰 Бюджет: *{budget:,.0f} грн*",
         f"🧾 Витрачено: *{total:,.0f} грн*",
         f"{status} — залишок *{remaining:,.0f} грн*",
-        f"📦 Товарів у кошику: *{len(items)}*",
+        f"📦 Позицій у кошику: *{len(items)}*",
     ]
-    if items:
+    if item_lines:
         lines.append("")
-        for c in items:
-            cost = parse_float(c.get("cost_price_uah", 0))
-            lines.append(f"• №{c.get('id')} {c.get('name','')} — {cost:,.0f} грн")
+        lines.extend(item_lines)
     return "\n".join(lines)
 
 def build_calc_csv(calcs: list) -> bytes:
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow([
-        "id", "name", "description", "link", "rating", "price_yuan", "price_uah",
-        "weight_kg", "delivery_method", "delivery_cost_usd", "delivery_cost_uah",
-        "cost_price_uah", "cost_price_usd", "created_at",
+        "id", "name", "description", "link", "rating", "price_yuan", "price_uah", "weight_kg",
+        "avia_delivery_cost_usd", "avia_delivery_cost_uah", "avia_cost_price_uah", "avia_cost_price_usd",
+        "sea_delivery_cost_usd", "sea_delivery_cost_uah", "sea_cost_price_uah", "sea_cost_price_usd",
+        "created_at",
     ])
     for c in calcs:
         writer.writerow([
             c.get("id", ""), c.get("name", ""), c.get("description", ""), c.get("link", ""),
-            c.get("rating", "0"), c.get("price_yuan", ""), c.get("price_uah", ""),
-            c.get("weight_kg", ""), c.get("delivery_method", ""), c.get("delivery_cost_usd", ""),
-            c.get("delivery_cost_uah", ""), c.get("cost_price_uah", ""), c.get("cost_price_usd", ""),
+            c.get("rating", "0"), c.get("price_yuan", ""), c.get("price_uah", ""), c.get("weight_kg", ""),
+            c.get("delivery_cost_usd_avia", ""), c.get("delivery_cost_uah_avia", ""),
+            c.get("cost_price_uah_avia", ""), c.get("cost_price_usd_avia", ""),
+            c.get("delivery_cost_usd_sea", ""), c.get("delivery_cost_uah_sea", ""),
+            c.get("cost_price_uah_sea", ""), c.get("cost_price_usd_sea", ""),
             c.get("created_at", ""),
         ])
     return output.getvalue().encode("utf-8-sig")
@@ -360,29 +362,31 @@ class CalcSettingsEdit(StatesGroup):
     typing = State()
 
 class CalcProduct(StatesGroup):
-    photo           = State()
-    name            = State()
-    description     = State()
-    link            = State()
-    rating          = State()
-    price_yuan      = State()
-    weight          = State()
-    delivery_method = State()
+    photo       = State()
+    name        = State()
+    description = State()
+    link        = State()
+    rating      = State()
+    price_yuan  = State()
+    weight      = State()
 
 class CalcEditField(StatesGroup):
-    typing          = State()
-    typing_delivery = State()
+    typing = State()
 
 class SendCalc(StatesGroup):
-    filter_choice  = State()
-    filter_rating  = State()
-    choosing       = State()
-    action_choice  = State()
+    filter_choice    = State()
+    filter_rating    = State()
+    choosing         = State()
+    action_choice    = State()
     waiting_username = State()
 
 class BasketCreate(StatesGroup):
     name   = State()
     budget = State()
+
+class BasketItemAdd(StatesGroup):
+    quantity = State()
+    method   = State()
 
 def kb_main() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
@@ -397,12 +401,6 @@ def kb_cancel() -> ReplyKeyboardMarkup:
 def kb_skip_cancel() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="⏩ Пропустити"), KeyboardButton(text="❌ Скасувати")]
-    ], resize_keyboard=True)
-
-def kb_delivery_method() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text="✈️ Авіа"), KeyboardButton(text="🚢 Море")],
-        [KeyboardButton(text="❌ Скасувати")],
     ], resize_keyboard=True)
 
 def kb_calc_menu(role: str = "full") -> ReplyKeyboardMarkup:
@@ -472,15 +470,12 @@ def ikb_calc_edit_fields(cid: int) -> InlineKeyboardMarkup:
         row = [InlineKeyboardButton(text=label, callback_data=f"editcalcfield:{cid}:{key}")
                for key, label in fields[i:i+2]]
         rows.append(row)
-    rows.append([InlineKeyboardButton(text="🚚 Спосіб доставки", callback_data=f"editcalcfield:{cid}:delivery_method")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def ikb_send_calc_filter() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🗂 Усі", callback_data="filtercalc:all")],
         [InlineKeyboardButton(text="⭐ Мін. рейтинг", callback_data="filtercalc:rating")],
-        [InlineKeyboardButton(text="✈️ Тільки авіа", callback_data="filtercalc:avia")],
-        [InlineKeyboardButton(text="🚢 Тільки море", callback_data="filtercalc:sea")],
     ])
 
 def ikb_send_calc_list(calcs: list, selected_ids) -> InlineKeyboardMarkup:
@@ -502,13 +497,14 @@ def ikb_send_calc_action() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="❌ Скасувати", callback_data="calcaction:cancel")],
     ])
 
-# ---- Клавіатури кошиків ----------------------------------------------------
-
 def ikb_baskets_list(baskets: list, calcs_by_id: dict) -> InlineKeyboardMarkup:
     rows = []
     for b in baskets:
-        items = [calcs_by_id[cid] for cid in b.get("calc_ids", []) if cid in calcs_by_id]
-        total = sum(parse_float(c.get("cost_price_uah", 0)) for c in items)
+        items = b.get("items", [])
+        total = sum(
+            parse_float(calcs_by_id.get(it["calc_id"], {}).get(f"cost_price_uah_{it['method']}", 0)) * it.get("qty", 1)
+            for it in items
+        )
         budget = parse_float(b.get("budget", 0))
         mark = "✅" if total <= budget else "⚠️"
         label = f"{mark} №{b['id']} {b.get('name','')[:18]} — {total:,.0f}/{budget:,.0f}грн"
@@ -531,8 +527,9 @@ def ikb_basket_add_list(bid: int, calcs: list, in_basket: set, page: int = 0, pe
     chunk = available[start:start + per_page]
     rows = []
     for c in chunk:
-        cost = parse_float(c.get("cost_price_uah", 0))
-        label = f"➕ №{c['id']} {c.get('name','')[:18]} — {cost:,.0f}грн"
+        avia = parse_float(c.get("cost_price_uah_avia", 0))
+        sea = parse_float(c.get("cost_price_uah_sea", 0))
+        label = f"➕ №{c['id']} {c.get('name','')[:16]} ✈️{avia:,.0f}/🚢{sea:,.0f}"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"basket_addsel:{bid}:{c['id']}:{page}")])
     nav = []
     if page > 0:
@@ -546,12 +543,16 @@ def ikb_basket_add_list(bid: int, calcs: list, in_basket: set, page: int = 0, pe
     rows.append([InlineKeyboardButton(text="✅ Готово", callback_data=f"basket_view:{bid}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def ikb_basket_remove_list(bid: int, calcs_by_id: dict) -> InlineKeyboardMarkup:
+def ikb_basket_remove_list(bid: int, items: list, calcs_by_id: dict) -> InlineKeyboardMarkup:
     rows = []
-    for cid, c in calcs_by_id.items():
-        cost = parse_float(c.get("cost_price_uah", 0))
-        label = f"➖ №{c.get('id')} {c.get('name','')[:18]} — {cost:,.0f}грн"
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"basket_rm:{bid}:{cid}")])
+    for it in items:
+        c = calcs_by_id.get(it["calc_id"], {})
+        method_label = DELIVERY_METHOD_LABELS.get(it["method"], "—")
+        unit_cost = parse_float(c.get(f"cost_price_uah_{it['method']}", 0))
+        qty = it.get("qty", 1)
+        total = unit_cost * qty
+        label = f"➖ №{it['calc_id']} {c.get('name','')[:14]} x{qty} {method_label} — {total:,.0f}грн"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"basket_rm:{bid}:{it['item_id']}")])
     rows.append([InlineKeyboardButton(text="✅ Готово", callback_data=f"basket_view:{bid}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -563,6 +564,13 @@ def ikb_pick_basket(cid: int, baskets: list) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text=label, callback_data=f"tobasketsel:{cid}:{b['id']}")])
     rows.append([InlineKeyboardButton(text="➕ Новий кошик", callback_data="basket_new")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def ikb_basket_item_method() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✈️ Авіа", callback_data="bimethod:avia")],
+        [InlineKeyboardButton(text="🚢 Море", callback_data="bimethod:sea")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="bimethod:cancel")],
+    ])
 
 CALC_SETTING_LABELS = {
     "price_per_kg_avia": "ціну доставки авіа за 1 кг ($)",
@@ -578,8 +586,6 @@ user_list_cache: dict = {}
 send_calc_cache: dict = {}
 
 async def require_auth(msg: Message, state: FSMContext, need_full: bool = False):
-    """Перевіряє доступ. Повертає роль ('full'/'calc') якщо дозволено, інакше None
-    (і сам відповідає користувачу — просить пароль або повідомляє про брак доступу)."""
     role = await get_role(msg.from_user.id)
     if role == "ERROR":
         await msg.answer(DB_ERROR_TEXT)
@@ -613,6 +619,21 @@ async def require_full_cb(cb: CallbackQuery) -> bool:
             pass
         return False
     return True
+
+async def send_basket_item_prompt(target: Message, state: FSMContext, bid: int, cid: int):
+    calc = await get_calc(cid)
+    if not calc:
+        await target.answer("⚠️ Товар не знайдено.")
+        return
+    await state.set_state(BasketItemAdd.quantity)
+    await state.update_data(bi_bid=bid, bi_cid=cid)
+    text = (
+        f"🧺 Додаємо *№{cid} — {calc.get('name','')}* у кошик №{bid}\n\n"
+        f"✈️ Авіа собівартість за од.: *{calc.get('cost_price_uah_avia',0):,.0f} грн*\n"
+        f"🚢 Море собівартість за од.: *{calc.get('cost_price_uah_sea',0):,.0f} грн*\n\n"
+        "🔢 Введіть кількість (шт.):"
+    )
+    await target.answer(text, reply_markup=kb_cancel())
 
 @dp.errors()
 async def global_error_handler(event, exception=None):
@@ -1064,61 +1085,37 @@ async def calc_weight(msg: Message, state: FSMContext):
     weight = parse_float(msg.text)
     if weight <= 0:
         return await msg.answer("⚠️ Введіть додатнє число, наприклад *0.5*:", reply_markup=kb_cancel())
-    await state.update_data(calc_weight=weight)
-    await state.set_state(CalcProduct.delivery_method)
-    await msg.answer("🚚 Оберіть *спосіб доставки*:", reply_markup=kb_delivery_method())
 
-@dp.message(CalcProduct.delivery_method)
-async def calc_delivery_method(msg: Message, state: FSMContext):
-    role = cached_role(msg.from_user.id)
-    if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu(role))
-    if msg.text not in ("✈️ Авіа", "🚢 Море"):
-        return await msg.answer("Будь ласка, оберіть спосіб доставки кнопкою нижче:", reply_markup=kb_delivery_method())
-
-    method = "avia" if msg.text == "✈️ Авіа" else "sea"
     fd = await state.get_data()
     name = fd["calc_name"]
     description = fd.get("calc_description", "")
     link = fd.get("calc_link", "")
     rating = fd.get("calc_rating", "0")
     price_yuan = fd["calc_price_yuan"]
-    weight = fd["calc_weight"]
     photo_id = fd.get("calc_photo_id", "")
     await state.clear()
 
-    s = await get_calc_settings()
-    rate_per_kg_usd = s["price_per_kg_avia"] if method == "avia" else s["price_per_kg_sea"]
-    delivery_cost_usd = weight * rate_per_kg_usd
-    delivery_cost_uah = delivery_cost_usd * s["usd_rate"]
-    price_uah = price_yuan * s["yuan_rate"]
-    cost_price_uah = price_uah + delivery_cost_uah
-    cost_price_usd = cost_price_uah / s["usd_rate"] if s["usd_rate"] else 0.0
-
+    cid = await next_calc_id()
     record = {
-        "id":                await next_calc_id(),
-        "name":              name,
-        "description":       description,
-        "link":              link,
-        "rating":            rating,
-        "photo_id":          photo_id,
-        "price_yuan":        price_yuan,
-        "price_uah":         price_uah,
-        "weight_kg":         weight,
-        "delivery_method":   method,
-        "delivery_cost_usd": delivery_cost_usd,
-        "delivery_cost_uah": delivery_cost_uah,
-        "cost_price_uah":    cost_price_uah,
-        "cost_price_usd":    cost_price_usd,
-        "created_at":        datetime.now().isoformat(),
-        "created_by":        msg.from_user.id,
+        "id":          cid,
+        "name":        name,
+        "description": description,
+        "link":        link,
+        "rating":      rating,
+        "photo_id":    photo_id,
+        "price_yuan":  price_yuan,
+        "weight_kg":   weight,
+        "created_at":  datetime.now().isoformat(),
+        "created_by":  msg.from_user.id,
     }
     await add_calc(record)
+    record = await recalc_calc_costs(cid)
 
-    if photo_id:
-        await msg.answer_photo(photo=photo_id, caption=fmt_calc(record), reply_markup=ikb_calc_actions(record["id"], record))
-    else:
-        await msg.answer(fmt_calc(record), reply_markup=ikb_calc_actions(record["id"], record))
+    if record:
+        if record.get("photo_id"):
+            await msg.answer_photo(photo=record["photo_id"], caption=fmt_calc(record), reply_markup=ikb_calc_actions(record["id"], record))
+        else:
+            await msg.answer(fmt_calc(record), reply_markup=ikb_calc_actions(record["id"], record))
     await msg.answer("Готово ✅ Розрахунок збережено.", reply_markup=kb_calc_menu(role))
 
 @dp.message(F.text == "📄 Мої розрахунки")
@@ -1153,23 +1150,18 @@ async def editcalcfield_choose(cb: CallbackQuery, state: FSMContext):
     try:
         _, cid_s, field = cb.data.split(":", 2)
         cid = int(cid_s)
-        if field == "delivery_method":
-            await state.set_state(CalcEditField.typing_delivery)
-            await state.update_data(edit_cid=cid)
-            await cb.message.answer("🚚 Оберіть новий спосіб доставки:", reply_markup=kb_delivery_method())
-        else:
-            await state.set_state(CalcEditField.typing)
-            await state.update_data(edit_cid=cid, edit_field=field)
-            labels = {
-                "name": "Назву", "description": "Опис", "link": "Посилання на товар",
-                "rating": "Оцінку (0-10)", "price_yuan": "Ціну товару (¥)", "weight_kg": "Вагу (кг)",
-            }
-            hint = ""
-            if field == "link":
-                hint = "\n_Має починатись з http:// або https://. Щоб прибрати посилання — надішліть «-»._"
-            elif field == "description":
-                hint = "\n_Щоб прибрати опис — надішліть «-»._"
-            await cb.message.answer(f"Введіть нове значення для *{labels.get(field, field)}*:{hint}", reply_markup=kb_cancel())
+        await state.set_state(CalcEditField.typing)
+        await state.update_data(edit_cid=cid, edit_field=field)
+        labels = {
+            "name": "Назву", "description": "Опис", "link": "Посилання на товар",
+            "rating": "Оцінку (0-10)", "price_yuan": "Ціну товару (¥)", "weight_kg": "Вагу (кг)",
+        }
+        hint = ""
+        if field == "link":
+            hint = "\n_Має починатись з http:// або https://. Щоб прибрати посилання — надішліть «-»._"
+        elif field == "description":
+            hint = "\n_Щоб прибрати опис — надішліть «-»._"
+        await cb.message.answer(f"Введіть нове значення для *{labels.get(field, field)}*:{hint}", reply_markup=kb_cancel())
         await cb.answer()
     except Exception:
         logger.exception("editcalcfield_choose failed")
@@ -1215,29 +1207,6 @@ async def editcalcfield_save(msg: Message, state: FSMContext):
     await update_calc(cid, update_fields)
     if field in ("price_yuan", "weight_kg"):
         await recalc_calc_costs(cid)
-    record = await get_calc(cid)
-    if record:
-        if record.get("photo_id"):
-            await msg.answer_photo(photo=record["photo_id"], caption=f"✅ Оновлено!\n\n{fmt_calc(record)}", reply_markup=ikb_calc_actions(cid, record))
-        else:
-            await msg.answer(f"✅ Оновлено!\n\n{fmt_calc(record)}", reply_markup=ikb_calc_actions(cid, record))
-        await msg.answer("Готово ✅", reply_markup=kb_calc_menu(role))
-    else:
-        await msg.answer("Розрахунок не знайдено.", reply_markup=kb_calc_menu(role))
-
-@dp.message(CalcEditField.typing_delivery)
-async def editcalcfield_delivery_save(msg: Message, state: FSMContext):
-    role = cached_role(msg.from_user.id)
-    if msg.text == "❌ Скасувати":
-        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu(role))
-    if msg.text not in ("✈️ Авіа", "🚢 Море"):
-        return await msg.answer("Оберіть спосіб доставки кнопкою нижче:", reply_markup=kb_delivery_method())
-    method = "avia" if msg.text == "✈️ Авіа" else "sea"
-    fd = await state.get_data()
-    cid = fd["edit_cid"]
-    await state.clear()
-    await update_calc(cid, {"delivery_method": method})
-    await recalc_calc_costs(cid)
     record = await get_calc(cid)
     if record:
         if record.get("photo_id"):
@@ -1310,9 +1279,6 @@ async def filtercalc_choose(cb: CallbackQuery, state: FSMContext):
         elif criterion == "rating":
             await state.set_state(SendCalc.filter_rating)
             await cb.message.answer("⭐ Введіть мінімальний рейтинг (0-10):", reply_markup=kb_cancel())
-        elif criterion in ("avia", "sea"):
-            filtered = [c for c in calcs if c.get("delivery_method") == criterion]
-            await _proceed_to_choosing(cb.message, state, filtered, uid, role)
         await cb.answer()
     except Exception:
         logger.exception("filtercalc_choose failed")
@@ -1520,10 +1486,6 @@ async def send_calc_do(msg: Message, state: FSMContext):
 
     await msg.answer(f"📤 Надіслано {sent}/{len(to_send)} розрахунків користувачу {username}.", reply_markup=kb_calc_menu(role))
 
-# ---------------------------------------------------------------------------
-# Кошики (бюджети) — хендлери
-# ---------------------------------------------------------------------------
-
 @dp.message(F.text == "🧺 Кошики")
 async def list_baskets(msg: Message, state: FSMContext):
     role = await require_auth(msg, state)
@@ -1533,7 +1495,7 @@ async def list_baskets(msg: Message, state: FSMContext):
         baskets = await get_all_baskets()
         all_ids = []
         for b in baskets:
-            all_ids.extend(b.get("calc_ids", []))
+            all_ids.extend(it["calc_id"] for it in b.get("items", []))
         calcs_by_id = await calcs_map_by_id(all_ids)
         text = f"🧺 *Кошики* — {len(baskets)} шт." if baskets else "📭 Кошиків ще немає."
         await msg.answer(text, reply_markup=kb_calc_menu(role))
@@ -1578,7 +1540,7 @@ async def basket_new_budget(msg: Message, state: FSMContext):
         "id":         await next_basket_id(),
         "name":       fd.get("basket_name", ""),
         "budget":     budget,
-        "calc_ids":   [],
+        "items":      [],
         "created_at": datetime.now().isoformat(),
         "created_by": msg.from_user.id,
     }
@@ -1593,7 +1555,7 @@ async def basket_view_cb(cb: CallbackQuery):
         b = await get_basket(bid)
         if not b:
             return await cb.answer("Кошик не знайдено!", show_alert=True)
-        calcs_by_id = await calcs_map_by_id(b.get("calc_ids", []))
+        calcs_by_id = await calcs_map_by_id([it["calc_id"] for it in b.get("items", [])])
         text = fmt_basket(b, calcs_by_id)
         try:
             await cb.message.edit_text(text, reply_markup=ikb_basket_actions(bid))
@@ -1613,7 +1575,7 @@ async def basket_back_cb(cb: CallbackQuery):
         baskets = await get_all_baskets()
         all_ids = []
         for b in baskets:
-            all_ids.extend(b.get("calc_ids", []))
+            all_ids.extend(it["calc_id"] for it in b.get("items", []))
         calcs_by_id = await calcs_map_by_id(all_ids)
         text = f"🧺 *Кошики* — {len(baskets)} шт." if baskets else "📭 Кошиків ще немає."
         try:
@@ -1657,8 +1619,8 @@ async def basket_add_cb(cb: CallbackQuery):
         calcs = await get_all_calcs()
         if not calcs:
             return await cb.answer("Немає жодного розрахунку. Спочатку створіть товар у калькуляторі.", show_alert=True)
-        in_basket = set(b.get("calc_ids", []))
-        text = f"➕ *Додавання товарів у кошик №{bid}*\nОберіть товар зі списку:"
+        in_basket = {it["calc_id"] for it in b.get("items", [])}
+        text = f"➕ *Додавання товарів у кошик №{bid}*\nОберіть товар зі списку (показано ціну ✈️авіа/🚢море):"
         try:
             await cb.message.edit_text(text, reply_markup=ikb_basket_add_list(bid, calcs, in_basket, page))
         except TelegramAPIError:
@@ -1672,27 +1634,15 @@ async def basket_add_cb(cb: CallbackQuery):
             pass
 
 @dp.callback_query(F.data.startswith("basket_addsel:"))
-async def basket_addsel_cb(cb: CallbackQuery):
+async def basket_addsel_cb(cb: CallbackQuery, state: FSMContext):
     try:
         _, bid_s, cid_s, page_s = cb.data.split(":")
-        bid, cid, page = int(bid_s), int(cid_s), int(page_s)
+        bid, cid = int(bid_s), int(cid_s)
         b = await get_basket(bid)
         if not b:
             return await cb.answer("Кошик не знайдено!", show_alert=True)
-        await basket_add_calc(bid, cid)
-        b = await get_basket(bid)
-        calcs = await get_all_calcs()
-        in_basket = set(b.get("calc_ids", []))
-        try:
-            await cb.message.edit_reply_markup(reply_markup=ikb_basket_add_list(bid, calcs, in_basket, page))
-        except TelegramAPIError:
-            pass
-        calcs_in = {c["id"]: c for c in calcs if c["id"] in in_basket}
-        total = sum(parse_float(c.get("cost_price_uah", 0)) for c in calcs_in.values())
-        budget = parse_float(b.get("budget", 0))
-        remaining = budget - total
-        note = "✅" if remaining >= 0 else "⚠️ бюджет перевищено"
-        await cb.answer(f"Додано! Витрачено {total:,.0f}/{budget:,.0f} грн {note}")
+        await send_basket_item_prompt(cb.message, state, bid, cid)
+        await cb.answer()
     except Exception:
         logger.exception("basket_addsel_cb failed")
         try:
@@ -1707,14 +1657,15 @@ async def basket_rmlist_cb(cb: CallbackQuery):
         b = await get_basket(bid)
         if not b:
             return await cb.answer("Кошик не знайдено!", show_alert=True)
-        if not b.get("calc_ids"):
+        items = b.get("items", [])
+        if not items:
             return await cb.answer("У кошику ще немає товарів.", show_alert=True)
-        calcs_by_id = await calcs_map_by_id(b.get("calc_ids", []))
-        text = f"➖ *Видалення товарів з кошика №{bid}*\nОберіть товар:"
+        calcs_by_id = await calcs_map_by_id([it["calc_id"] for it in items])
+        text = f"➖ *Видалення товарів з кошика №{bid}*\nОберіть позицію:"
         try:
-            await cb.message.edit_text(text, reply_markup=ikb_basket_remove_list(bid, calcs_by_id))
+            await cb.message.edit_text(text, reply_markup=ikb_basket_remove_list(bid, items, calcs_by_id))
         except TelegramAPIError:
-            await cb.message.answer(text, reply_markup=ikb_basket_remove_list(bid, calcs_by_id))
+            await cb.message.answer(text, reply_markup=ikb_basket_remove_list(bid, items, calcs_by_id))
         await cb.answer()
     except Exception:
         logger.exception("basket_rmlist_cb failed")
@@ -1726,15 +1677,16 @@ async def basket_rmlist_cb(cb: CallbackQuery):
 @dp.callback_query(F.data.startswith("basket_rm:"))
 async def basket_rm_cb(cb: CallbackQuery):
     try:
-        _, bid_s, cid_s = cb.data.split(":")
-        bid, cid = int(bid_s), int(cid_s)
-        await basket_remove_calc(bid, cid)
+        _, bid_s, item_id = cb.data.split(":", 2)
+        bid = int(bid_s)
+        await basket_remove_item(bid, item_id)
         b = await get_basket(bid)
         if not b:
             return await cb.answer("Кошик не знайдено!", show_alert=True)
-        calcs_by_id = await calcs_map_by_id(b.get("calc_ids", []))
+        items = b.get("items", [])
+        calcs_by_id = await calcs_map_by_id([it["calc_id"] for it in items])
         try:
-            await cb.message.edit_reply_markup(reply_markup=ikb_basket_remove_list(bid, calcs_by_id))
+            await cb.message.edit_reply_markup(reply_markup=ikb_basket_remove_list(bid, items, calcs_by_id))
         except TelegramAPIError:
             pass
         await cb.answer("Прибрано!")
@@ -1763,24 +1715,95 @@ async def tobasket_cb(cb: CallbackQuery):
             pass
 
 @dp.callback_query(F.data.startswith("tobasketsel:"))
-async def tobasketsel_cb(cb: CallbackQuery):
+async def tobasketsel_cb(cb: CallbackQuery, state: FSMContext):
     try:
         _, cid_s, bid_s = cb.data.split(":")
         cid, bid = int(cid_s), int(bid_s)
         b = await get_basket(bid)
         if not b:
             return await cb.answer("Кошик не знайдено!", show_alert=True)
-        await basket_add_calc(bid, cid)
-        b = await get_basket(bid)
-        calcs_by_id = await calcs_map_by_id(b.get("calc_ids", []))
-        total = sum(parse_float(c.get("cost_price_uah", 0)) for c in calcs_by_id.values())
-        budget = parse_float(b.get("budget", 0))
-        remaining = budget - total
-        note = "✅" if remaining >= 0 else "⚠️ бюджет перевищено"
-        await cb.message.answer(f"✅ Додано у кошик №{bid}.\nВитрачено {total:,.0f}/{budget:,.0f} грн {note}")
-        await cb.answer("Додано!")
+        await send_basket_item_prompt(cb.message, state, bid, cid)
+        await cb.answer()
     except Exception:
         logger.exception("tobasketsel_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.message(BasketItemAdd.quantity)
+async def basket_item_qty(msg: Message, state: FSMContext):
+    role = cached_role(msg.from_user.id)
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu(role))
+    qty = parse_int(msg.text)
+    if qty <= 0:
+        return await msg.answer("⚠️ Введіть ціле додатне число, наприклад *2*:", reply_markup=kb_cancel())
+    fd = await state.get_data()
+    bid, cid = fd["bi_bid"], fd["bi_cid"]
+    calc = await get_calc(cid)
+    if not calc:
+        await state.clear()
+        return await msg.answer("⚠️ Товар не знайдено.", reply_markup=kb_calc_menu(role))
+    await state.update_data(bi_qty=qty)
+    await state.set_state(BasketItemAdd.method)
+    avia_total = parse_float(calc.get("cost_price_uah_avia", 0)) * qty
+    sea_total = parse_float(calc.get("cost_price_uah_sea", 0)) * qty
+    text = (
+        f"🔢 Кількість: *{qty} шт.*\n\n"
+        f"✈️ Авіа — *{avia_total:,.0f} грн*\n"
+        f"🚢 Море — *{sea_total:,.0f} грн*\n\n"
+        "Оберіть спосіб доставки:"
+    )
+    await msg.answer(text, reply_markup=ikb_basket_item_method())
+
+@dp.callback_query(F.data.startswith("bimethod:"), BasketItemAdd.method)
+async def basket_item_method(cb: CallbackQuery, state: FSMContext):
+    try:
+        action = cb.data.split(":", 1)[1]
+        role = cached_role(cb.from_user.id)
+        if action == "cancel":
+            await state.clear()
+            await cb.message.answer("Скасовано.", reply_markup=kb_calc_menu(role))
+            return await cb.answer()
+
+        method = action
+        fd = await state.get_data()
+        bid, cid, qty = fd["bi_bid"], fd["bi_cid"], fd["bi_qty"]
+        await state.clear()
+
+        calc = await get_calc(cid)
+        b = await get_basket(bid)
+        if not calc or not b:
+            await cb.message.answer("⚠️ Товар або кошик не знайдено.", reply_markup=kb_calc_menu(role))
+            return await cb.answer()
+
+        item_id = uuid.uuid4().hex[:8]
+        unit_cost = parse_float(calc.get(f"cost_price_uah_{method}", 0))
+        total_cost = unit_cost * qty
+        item = {"item_id": item_id, "calc_id": cid, "qty": qty, "method": method}
+        await basket_add_item(bid, item)
+
+        method_label = DELIVERY_METHOD_LABELS.get(method, "—")
+        caption = (
+            f"✅ *Додано в кошик №{bid}!*\n\n"
+            f"*№{cid} — {calc.get('name','')}*\n"
+            f"🔢 Кількість: *{qty} шт.*\n"
+            f"🚚 Доставка: {method_label}\n"
+            f"💰 Вартість позиції: *{total_cost:,.0f} грн*"
+        )
+        if calc.get("photo_id"):
+            await cb.message.answer_photo(photo=calc["photo_id"], caption=caption)
+        else:
+            await cb.message.answer(caption)
+
+        b = await get_basket(bid)
+        calcs_by_id = await calcs_map_by_id([it["calc_id"] for it in b.get("items", [])])
+        await cb.message.answer(fmt_basket(b, calcs_by_id), reply_markup=ikb_basket_actions(bid))
+        await cb.message.answer("Готово ✅", reply_markup=kb_calc_menu(role))
+        await cb.answer("Додано!")
+    except Exception:
+        logger.exception("basket_item_method failed")
         try:
             await cb.answer(DB_ERROR_TEXT, show_alert=True)
         except TelegramAPIError:
