@@ -451,6 +451,7 @@ def ikb_calc_settings() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🚢 Ціна доставки морем (за 1 кг, $)", callback_data="calcset:price_per_kg_sea")],
         [InlineKeyboardButton(text="💱 Змінити курс юаня", callback_data="calcset:yuan_rate")],
         [InlineKeyboardButton(text="💵 Змінити курс долара", callback_data="calcset:usd_rate")],
+        [InlineKeyboardButton(text="🔄 Перерахувати всі товари", callback_data="calcset_recalc_all")],
     ])
 
 def ikb_calc_actions(cid: int, calc: dict | None = None) -> InlineKeyboardMarkup:
@@ -962,6 +963,20 @@ async def calcset_choose(cb: CallbackQuery, state: FSMContext):
         except TelegramAPIError:
             pass
 
+@dp.callback_query(F.data == "calcset_recalc_all")
+async def calcset_recalc_all_cb(cb: CallbackQuery):
+    try:
+        calcs = await get_all_calcs()
+        await recalc_all_calcs()
+        await cb.message.answer(f"🔄 Перераховано {len(calcs)} товар(ів).")
+        await cb.answer("Готово!")
+    except Exception:
+        logger.exception("calcset_recalc_all_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
 @dp.message(CalcSettingsEdit.typing)
 async def calcset_save(msg: Message, state: FSMContext):
     role = cached_role(msg.from_user.id)
@@ -974,6 +989,7 @@ async def calcset_save(msg: Message, state: FSMContext):
         return await msg.answer("⚠️ Введіть додатнє число, наприклад *12.5*:", reply_markup=kb_cancel())
     await state.clear()
     await save_calc_setting(field, value)
+    await recalc_all_calcs()
     s = await get_calc_settings()
     text = (
         "✅ Збережено!\n\n"
@@ -1127,6 +1143,7 @@ async def calc_weight(msg: Message, state: FSMContext):
 async def list_calcs(msg: Message, state: FSMContext):
     role = await require_auth(msg, state)
     if not role: return
+    await recalc_all_calcs()
     calcs = await get_all_calcs()
     if not calcs:
         return await msg.answer("📭 Розрахунків ще немає.", reply_markup=kb_calc_menu(role))
@@ -1497,6 +1514,7 @@ async def list_baskets(msg: Message, state: FSMContext):
     if not role: return
     await state.clear()
     try:
+        await recalc_all_calcs()
         baskets = await get_all_baskets()
         all_ids = []
         for b in baskets:
@@ -1560,6 +1578,7 @@ async def basket_view_cb(cb: CallbackQuery):
         b = await get_basket(bid)
         if not b:
             return await cb.answer("Кошик не знайдено!", show_alert=True)
+        await recalc_all_calcs()
         calcs_by_id = await calcs_map_by_id([it["calc_id"] for it in b.get("items", [])])
         text = fmt_basket(b, calcs_by_id)
         try:
@@ -1850,6 +1869,7 @@ async def main():
         logger.exception("MongoDB connection FAILED at startup")
 
     await load_user_roles()
+    await recalc_all_calcs()
 
     app = web.Application()
     app.router.add_get("/", health)
