@@ -18,6 +18,7 @@ from aiogram.types import (
     Message, CallbackQuery, BufferedInputFile,
     InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
+    InputMediaPhoto,
 )
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import PyMongoError
@@ -227,11 +228,18 @@ async def get_all_baskets() -> list:
 async def delete_basket(bid: int):
     await db_call(baskets_col.delete_one({"id": bid}))
 
+async def update_basket(bid: int, fields: dict):
+    await db_call(baskets_col.update_one({"id": bid}, {"$set": fields}))
+
 async def basket_add_item(bid: int, item: dict):
     await db_call(baskets_col.update_one({"id": bid}, {"$push": {"items": item}}))
 
 async def basket_remove_item(bid: int, item_id: str):
     await db_call(baskets_col.update_one({"id": bid}, {"$pull": {"items": {"item_id": item_id}}}))
+
+async def basket_update_item(bid: int, item_id: str, fields: dict):
+    update = {f"items.$.{k}": v for k, v in fields.items()}
+    await db_call(baskets_col.update_one({"id": bid, "items.item_id": item_id}, {"$set": update}))
 
 async def calcs_map_by_id(ids: list) -> dict:
     ids = list(set(ids))
@@ -301,30 +309,46 @@ def fmt_calc(c: dict) -> str:
     return "\n".join(lines)
 
 def fmt_basket(b: dict, calcs_by_id: dict) -> str:
+    """
+    Розраховує статистику кошика окремо по товару та по доставці,
+    а не лише загальну собівартість.
+    """
     items = b.get("items", [])
-    total = 0.0
+    total_product = 0.0
+    total_delivery = 0.0
     item_lines = []
     for it in items:
         c = calcs_by_id.get(it["calc_id"])
         if not c:
+            item_lines.append(f"• №{it['calc_id']} — ⚠️ товар видалено")
             continue
-        unit_cost = parse_float(c.get(f"cost_price_uah_{it['method']}", 0))
         qty = it.get("qty", 1)
-        line_total = unit_cost * qty
-        total += line_total
-        method_label = DELIVERY_METHOD_LABELS.get(it["method"], "—")
+        method = it.get("method", "avia")
+        unit_product = parse_float(c.get("price_uah", 0))
+        unit_delivery = parse_float(c.get(f"delivery_cost_uah_{method}", 0))
+        line_product = unit_product * qty
+        line_delivery = unit_delivery * qty
+        line_total = line_product + line_delivery
+        total_product += line_product
+        total_delivery += line_delivery
+        method_label = DELIVERY_METHOD_LABELS.get(method, "—")
         item_lines.append(
-            f"• №{it['calc_id']} {c.get('name','')} x{qty} {method_label} — {line_total:,.0f} грн"
+            f"• №{it['calc_id']} {c.get('name','')} x{qty} {method_label} — *{line_total:,.0f} грн*\n"
+            f"   ↳ товар {line_product:,.0f} грн + доставка {line_delivery:,.0f} грн"
         )
+    total = total_product + total_delivery
     budget = parse_float(b.get("budget", 0))
     remaining = budget - total
     status = "✅ У межах бюджету" if remaining >= 0 else "⚠️ Бюджет перевищено"
     lines = [
         f"*🧺 Кошик №{b.get('id')} — {b.get('name','')}*",
         f"💰 Бюджет: *{budget:,.0f} грн*",
-        f"🧾 Витрачено: *{total:,.0f} грн*",
+        "",
+        f"📦 Витрати на товар: *{total_product:,.0f} грн*",
+        f"🚚 Витрати на доставку: *{total_delivery:,.0f} грн*",
+        f"🧾 Разом: *{total:,.0f} грн*",
         f"{status} — залишок *{remaining:,.0f} грн*",
-        f"📦 Позицій у кошику: *{len(items)}*",
+        f"🗂 Позицій у кошику: *{len(items)}*",
     ]
     if item_lines:
         lines.append("")
@@ -389,7 +413,14 @@ class BasketCreate(StatesGroup):
     name   = State()
     budget = State()
 
+class BasketEditField(StatesGroup):
+    typing = State()
+
 class BasketItemAdd(StatesGroup):
+    quantity = State()
+    method   = State()
+
+class BasketItemEdit(StatesGroup):
     quantity = State()
     method   = State()
 
@@ -521,10 +552,18 @@ def ikb_baskets_list(baskets: list, calcs_by_id: dict) -> InlineKeyboardMarkup:
 def ikb_basket_actions(bid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Додати товар", callback_data=f"basket_add:{bid}:0")],
-        [InlineKeyboardButton(text="➖ Прибрати товар", callback_data=f"basket_rmlist:{bid}")],
+        [InlineKeyboardButton(text="✏️ Редагувати позиції", callback_data=f"basket_rmlist:{bid}")],
+        [InlineKeyboardButton(text="📝 Редагувати кошик", callback_data=f"basket_edit:{bid}")],
         [InlineKeyboardButton(text="🔄 Оновити", callback_data=f"basket_view:{bid}")],
         [InlineKeyboardButton(text="🗑 Видалити кошик", callback_data=f"basket_del:{bid}")],
         [InlineKeyboardButton(text="◀️ До списку кошиків", callback_data="basket_back")],
+    ])
+
+def ikb_basket_edit_fields(bid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Назва кошика", callback_data=f"basketeditfield:{bid}:name")],
+        [InlineKeyboardButton(text="💰 Бюджет", callback_data=f"basketeditfield:{bid}:budget")],
+        [InlineKeyboardButton(text="◀️ Назад до кошика", callback_data=f"basket_view:{bid}")],
     ])
 
 def ikb_basket_add_list(bid: int, calcs: list, in_basket: set, page: int = 0, per_page: int = 8) -> InlineKeyboardMarkup:
@@ -550,6 +589,7 @@ def ikb_basket_add_list(bid: int, calcs: list, in_basket: set, page: int = 0, pe
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def ikb_basket_remove_list(bid: int, items: list, calcs_by_id: dict) -> InlineKeyboardMarkup:
+    """Список позицій кошика — тап відкриває меню редагування/видалення позиції."""
     rows = []
     for it in items:
         c = calcs_by_id.get(it["calc_id"], {})
@@ -557,10 +597,17 @@ def ikb_basket_remove_list(bid: int, items: list, calcs_by_id: dict) -> InlineKe
         unit_cost = parse_float(c.get(f"cost_price_uah_{it['method']}", 0))
         qty = it.get("qty", 1)
         total = unit_cost * qty
-        label = f"➖ №{it['calc_id']} {c.get('name','')[:14]} x{qty} {method_label} — {total:,.0f}грн"
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"basket_rm:{bid}:{it['item_id']}")])
+        label = f"✏️ №{it['calc_id']} {c.get('name','')[:14]} x{qty} {method_label} — {total:,.0f}грн"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"basket_item_open:{bid}:{it['item_id']}")])
     rows.append([InlineKeyboardButton(text="✅ Готово", callback_data=f"basket_view:{bid}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def ikb_basket_item_actions(bid: int, item_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Змінити кількість/доставку", callback_data=f"basket_item_edit:{bid}:{item_id}")],
+        [InlineKeyboardButton(text="🗑 Видалити позицію", callback_data=f"basket_rm:{bid}:{item_id}")],
+        [InlineKeyboardButton(text="◀️ Назад до кошика", callback_data=f"basket_view:{bid}")],
+    ])
 
 def ikb_pick_basket(cid: int, baskets: list) -> InlineKeyboardMarkup:
     rows = []
@@ -640,6 +687,76 @@ async def send_basket_item_prompt(target: Message, state: FSMContext, bid: int, 
         "🔢 Введіть кількість (шт.):"
     )
     await target.answer(text, reply_markup=kb_cancel())
+
+async def send_basket_photos(chat_id: int, items: list, calcs_by_id: dict):
+    """Надсилає фото всіх товарів, що є в кошику (альбомами по 10, з підписом позиції)."""
+    media = []
+    for it in items:
+        c = calcs_by_id.get(it["calc_id"])
+        if not c or not c.get("photo_id"):
+            continue
+        method_label = DELIVERY_METHOD_LABELS.get(it.get("method"), "—")
+        qty = it.get("qty", 1)
+        unit_product = parse_float(c.get("price_uah", 0))
+        unit_delivery = parse_float(c.get(f"delivery_cost_uah_{it.get('method')}", 0))
+        line_total = (unit_product + unit_delivery) * qty
+        caption = (
+            f"№{it['calc_id']} — {c.get('name','')}\n"
+            f"{qty} шт. {method_label}\n"
+            f"Разом: {line_total:,.0f} грн"
+        )
+        media.append(InputMediaPhoto(media=c["photo_id"], caption=caption[:1024]))
+
+    if not media:
+        return
+
+    for i in range(0, len(media), 10):
+        chunk = media[i:i + 10]
+        try:
+            if len(chunk) == 1:
+                m = chunk[0]
+                await bot.send_photo(chat_id=chat_id, photo=m.media, caption=m.caption)
+            else:
+                await bot.send_media_group(chat_id=chat_id, media=chunk)
+        except TelegramAPIError:
+            logger.exception("Не вдалось надіслати фото товарів кошика")
+
+async def show_basket(source, bid: int):
+    """
+    Показує повну картку кошика: текст зі статистикою (окремо товар/доставка),
+    кнопки дій та фото всіх товарів, що в ньому лежать.
+    `source` — Message або CallbackQuery.
+    """
+    is_cb = isinstance(source, CallbackQuery)
+    chat_msg: Message = source.message if is_cb else source
+
+    b = await get_basket(bid)
+    if not b:
+        text = "⚠️ Кошик не знайдено."
+        if is_cb:
+            try:
+                await source.answer(text, show_alert=True)
+            except TelegramAPIError:
+                pass
+        else:
+            await chat_msg.answer(text)
+        return
+
+    await recalc_all_calcs()
+    b = await get_basket(bid)
+    items = b.get("items", [])
+    calcs_by_id = await calcs_map_by_id([it["calc_id"] for it in items])
+    text = fmt_basket(b, calcs_by_id)
+
+    if is_cb:
+        try:
+            await chat_msg.edit_text(text, reply_markup=ikb_basket_actions(bid))
+        except TelegramAPIError:
+            await chat_msg.answer(text, reply_markup=ikb_basket_actions(bid))
+    else:
+        await chat_msg.answer(text, reply_markup=ikb_basket_actions(bid))
+
+    await send_basket_photos(chat_msg.chat.id, items, calcs_by_id)
 
 @dp.errors()
 async def global_error_handler(event, exception=None):
@@ -1559,8 +1676,9 @@ async def basket_new_budget(msg: Message, state: FSMContext):
         return await msg.answer("⚠️ Введіть додатнє число, наприклад *5000*:", reply_markup=kb_cancel())
     fd = await state.get_data()
     await state.clear()
+    bid = await next_basket_id()
     basket = {
-        "id":         await next_basket_id(),
+        "id":         bid,
         "name":       fd.get("basket_name", ""),
         "budget":     budget,
         "items":      [],
@@ -1568,23 +1686,14 @@ async def basket_new_budget(msg: Message, state: FSMContext):
         "created_by": msg.from_user.id,
     }
     await add_basket(basket)
-    await msg.answer(f"✅ *Кошик створено!*\n\n{fmt_basket(basket, {})}", reply_markup=ikb_basket_actions(basket["id"]))
-    await msg.answer("Готово ✅", reply_markup=kb_calc_menu(role))
+    await msg.answer("✅ *Кошик створено!*", reply_markup=kb_calc_menu(role))
+    await show_basket(msg, bid)
 
 @dp.callback_query(F.data.startswith("basket_view:"))
 async def basket_view_cb(cb: CallbackQuery):
     try:
         bid = int(cb.data.split(":")[1])
-        b = await get_basket(bid)
-        if not b:
-            return await cb.answer("Кошик не знайдено!", show_alert=True)
-        await recalc_all_calcs()
-        calcs_by_id = await calcs_map_by_id([it["calc_id"] for it in b.get("items", [])])
-        text = fmt_basket(b, calcs_by_id)
-        try:
-            await cb.message.edit_text(text, reply_markup=ikb_basket_actions(bid))
-        except TelegramAPIError:
-            await cb.message.answer(text, reply_markup=ikb_basket_actions(bid))
+        await show_basket(cb, bid)
         await cb.answer()
     except Exception:
         logger.exception("basket_view_cb failed")
@@ -1631,6 +1740,65 @@ async def basket_del_cb(cb: CallbackQuery):
             await cb.answer(DB_ERROR_TEXT, show_alert=True)
         except TelegramAPIError:
             pass
+
+@dp.callback_query(F.data.startswith("basket_edit:"))
+async def basket_edit_start(cb: CallbackQuery):
+    try:
+        bid = int(cb.data.split(":")[1])
+        b = await get_basket(bid)
+        if not b:
+            return await cb.answer("Кошик не знайдено!", show_alert=True)
+        await cb.message.answer(
+            f"✏️ *Редагування кошика №{bid} — {b.get('name','')}*\nОберіть, що змінити:",
+            reply_markup=ikb_basket_edit_fields(bid),
+        )
+        await cb.answer()
+    except Exception:
+        logger.exception("basket_edit_start failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data.startswith("basketeditfield:"))
+async def basketeditfield_choose(cb: CallbackQuery, state: FSMContext):
+    try:
+        _, bid_s, field = cb.data.split(":", 2)
+        bid = int(bid_s)
+        await state.set_state(BasketEditField.typing)
+        await state.update_data(bef_bid=bid, bef_field=field)
+        label = "назву кошика" if field == "name" else "бюджет кошика (грн)"
+        await cb.message.answer(f"Введіть нове значення для {label}:", reply_markup=kb_cancel())
+        await cb.answer()
+    except Exception:
+        logger.exception("basketeditfield_choose failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.message(BasketEditField.typing)
+async def basketeditfield_save(msg: Message, state: FSMContext):
+    role = cached_role(msg.from_user.id)
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu(role))
+    fd = await state.get_data()
+    bid, field = fd["bef_bid"], fd["bef_field"]
+
+    if field == "name":
+        value = msg.text.strip()
+        if not value:
+            return await msg.answer("⚠️ Назва не може бути порожньою:", reply_markup=kb_cancel())
+        await update_basket(bid, {"name": value})
+    else:
+        value = parse_float(msg.text)
+        if value <= 0:
+            return await msg.answer("⚠️ Введіть додатнє число, наприклад *5000*:", reply_markup=kb_cancel())
+        await update_basket(bid, {"budget": value})
+
+    await state.clear()
+    await msg.answer("✅ Кошик оновлено!", reply_markup=kb_calc_menu(role))
+    await show_basket(msg, bid)
 
 @dp.callback_query(F.data.startswith("basket_add:"))
 async def basket_add_cb(cb: CallbackQuery):
@@ -1685,7 +1853,7 @@ async def basket_rmlist_cb(cb: CallbackQuery):
         if not items:
             return await cb.answer("У кошику ще немає товарів.", show_alert=True)
         calcs_by_id = await calcs_map_by_id([it["calc_id"] for it in items])
-        text = f"➖ *Видалення товарів з кошика №{bid}*\nОберіть позицію:"
+        text = f"✏️ *Редагування позицій кошика №{bid}*\nОберіть позицію:"
         try:
             await cb.message.edit_text(text, reply_markup=ikb_basket_remove_list(bid, items, calcs_by_id))
         except TelegramAPIError:
@@ -1698,22 +1866,127 @@ async def basket_rmlist_cb(cb: CallbackQuery):
         except TelegramAPIError:
             pass
 
+@dp.callback_query(F.data.startswith("basket_item_open:"))
+async def basket_item_open_cb(cb: CallbackQuery):
+    try:
+        _, bid_s, item_id = cb.data.split(":", 2)
+        bid = int(bid_s)
+        b = await get_basket(bid)
+        if not b:
+            return await cb.answer("Кошик не знайдено!", show_alert=True)
+        item = next((it for it in b.get("items", []) if it["item_id"] == item_id), None)
+        if not item:
+            return await cb.answer("Позицію не знайдено!", show_alert=True)
+        calc = await get_calc(item["calc_id"])
+        name = calc.get("name", "") if calc else "⚠️ товар видалено"
+        method_label = DELIVERY_METHOD_LABELS.get(item["method"], "—")
+        text = (
+            f"№{item['calc_id']} — {name}\n"
+            f"🔢 Кількість: *{item.get('qty',1)} шт.*\n"
+            f"🚚 Доставка: {method_label}"
+        )
+        await cb.message.answer(text, reply_markup=ikb_basket_item_actions(bid, item_id))
+        await cb.answer()
+    except Exception:
+        logger.exception("basket_item_open_cb failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.callback_query(F.data.startswith("basket_item_edit:"))
+async def basket_item_edit_start(cb: CallbackQuery, state: FSMContext):
+    try:
+        _, bid_s, item_id = cb.data.split(":", 2)
+        bid = int(bid_s)
+        b = await get_basket(bid)
+        if not b:
+            return await cb.answer("Кошик не знайдено!", show_alert=True)
+        item = next((it for it in b.get("items", []) if it["item_id"] == item_id), None)
+        if not item:
+            return await cb.answer("Позицію не знайдено!", show_alert=True)
+        calc = await get_calc(item["calc_id"])
+        if not calc:
+            return await cb.answer("Товар за цією позицією не знайдено.", show_alert=True)
+        await state.set_state(BasketItemEdit.quantity)
+        await state.update_data(bie_bid=bid, bie_item_id=item_id, bie_cid=item["calc_id"])
+        await cb.message.answer(
+            f"🔢 Поточна кількість: *{item.get('qty',1)} шт.*\nВведіть нову кількість:",
+            reply_markup=kb_cancel(),
+        )
+        await cb.answer()
+    except Exception:
+        logger.exception("basket_item_edit_start failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
+@dp.message(BasketItemEdit.quantity)
+async def basket_item_edit_qty(msg: Message, state: FSMContext):
+    role = cached_role(msg.from_user.id)
+    if msg.text == "❌ Скасувати":
+        await state.clear(); return await msg.answer("Скасовано.", reply_markup=kb_calc_menu(role))
+    qty = parse_int(msg.text)
+    if qty <= 0:
+        return await msg.answer("⚠️ Введіть ціле додатне число, наприклад *2*:", reply_markup=kb_cancel())
+    fd = await state.get_data()
+    cid = fd["bie_cid"]
+    calc = await get_calc(cid)
+    if not calc:
+        await state.clear()
+        return await msg.answer("⚠️ Товар не знайдено.", reply_markup=kb_calc_menu(role))
+    await state.update_data(bie_qty=qty)
+    await state.set_state(BasketItemEdit.method)
+    avia_total = parse_float(calc.get("cost_price_uah_avia", 0)) * qty
+    sea_total = parse_float(calc.get("cost_price_uah_sea", 0)) * qty
+    text = (
+        f"🔢 Кількість: *{qty} шт.*\n\n"
+        f"✈️ Авіа — *{avia_total:,.0f} грн*\n"
+        f"🚢 Море — *{sea_total:,.0f} грн*\n\n"
+        "Оберіть спосіб доставки:"
+    )
+    await msg.answer(text, reply_markup=ikb_basket_item_method())
+
+@dp.callback_query(F.data.startswith("bimethod:"), BasketItemEdit.method)
+async def basket_item_edit_method(cb: CallbackQuery, state: FSMContext):
+    try:
+        action = cb.data.split(":", 1)[1]
+        role = cached_role(cb.from_user.id)
+        if action == "cancel":
+            await state.clear()
+            await cb.message.answer("Скасовано.", reply_markup=kb_calc_menu(role))
+            return await cb.answer()
+
+        method = action
+        fd = await state.get_data()
+        bid, item_id, qty = fd["bie_bid"], fd["bie_item_id"], fd["bie_qty"]
+        await state.clear()
+
+        b = await get_basket(bid)
+        if not b:
+            await cb.message.answer("⚠️ Кошик не знайдено.", reply_markup=kb_calc_menu(role))
+            return await cb.answer()
+
+        await basket_update_item(bid, item_id, {"qty": qty, "method": method})
+        await cb.message.answer("✅ Позицію оновлено!", reply_markup=kb_calc_menu(role))
+        await show_basket(cb.message, bid)
+        await cb.answer("Оновлено!")
+    except Exception:
+        logger.exception("basket_item_edit_method failed")
+        try:
+            await cb.answer(DB_ERROR_TEXT, show_alert=True)
+        except TelegramAPIError:
+            pass
+
 @dp.callback_query(F.data.startswith("basket_rm:"))
 async def basket_rm_cb(cb: CallbackQuery):
     try:
         _, bid_s, item_id = cb.data.split(":", 2)
         bid = int(bid_s)
         await basket_remove_item(bid, item_id)
-        b = await get_basket(bid)
-        if not b:
-            return await cb.answer("Кошик не знайдено!", show_alert=True)
-        items = b.get("items", [])
-        calcs_by_id = await calcs_map_by_id([it["calc_id"] for it in items])
-        try:
-            await cb.message.edit_reply_markup(reply_markup=ikb_basket_remove_list(bid, items, calcs_by_id))
-        except TelegramAPIError:
-            pass
         await cb.answer("Прибрано!")
+        await show_basket(cb.message, bid)
     except Exception:
         logger.exception("basket_rm_cb failed")
         try:
@@ -1803,28 +2076,11 @@ async def basket_item_method(cb: CallbackQuery, state: FSMContext):
             return await cb.answer()
 
         item_id = uuid.uuid4().hex[:8]
-        unit_cost = parse_float(calc.get(f"cost_price_uah_{method}", 0))
-        total_cost = unit_cost * qty
         item = {"item_id": item_id, "calc_id": cid, "qty": qty, "method": method}
         await basket_add_item(bid, item)
 
-        method_label = DELIVERY_METHOD_LABELS.get(method, "—")
-        caption = (
-            f"✅ *Додано в кошик №{bid}!*\n\n"
-            f"*№{cid} — {calc.get('name','')}*\n"
-            f"🔢 Кількість: *{qty} шт.*\n"
-            f"🚚 Доставка: {method_label}\n"
-            f"💰 Вартість позиції: *{total_cost:,.0f} грн*"
-        )
-        if calc.get("photo_id"):
-            await cb.message.answer_photo(photo=calc["photo_id"], caption=caption)
-        else:
-            await cb.message.answer(caption)
-
-        b = await get_basket(bid)
-        calcs_by_id = await calcs_map_by_id([it["calc_id"] for it in b.get("items", [])])
-        await cb.message.answer(fmt_basket(b, calcs_by_id), reply_markup=ikb_basket_actions(bid))
-        await cb.message.answer("Готово ✅", reply_markup=kb_calc_menu(role))
+        await cb.message.answer(f"✅ Додано в кошик №{bid}!", reply_markup=kb_calc_menu(role))
+        await show_basket(cb.message, bid)
         await cb.answer("Додано!")
     except Exception:
         logger.exception("basket_item_method failed")
